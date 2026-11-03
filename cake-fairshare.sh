@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 CONF_DIR="/etc/cake-fairshare"
 CONF="${CONF_DIR}/config"
 UNIT="/etc/systemd/system/cake-fairshare.service"
@@ -169,19 +169,8 @@ apply_one() {
   r_in="${RATE_INGRESS:-$rate}"
 
   cur=$(root_qdisc "$ifc")
-  if [ "$cur" = "mq" ]; then
-    if cake_mq_supported; then
-      qdisc="cake_mq"
-      ok "$ifc 为多队列网卡，改用 cake_mq"
-    else
-      bad "$ifc 的根 qdisc 是 mq（多发送队列），当前内核无法直接挂 cake"
-      note "方案一（立即可用，可回滚）：把该网卡发送队列降为 1"
-      note "    ethtool -L $ifc combined 1"
-      note "方案二（长期）：升级到带 cake_mq 的内核"
-      logline "FAIL $ifc mq-without-cake_mq"
-      return 1
-    fi
-  fi
+  # 注意：不要把 mq 当成障碍。多队列网卡的 root 是 mq，但 replace 到 cake 是允许的，
+  # 只有 replace 真失败时才需要降到单队列（见下方失败分支）。
 
   prev_orig=$(get_state "$ifc" ORIG_QDISC)
   prev_ifb=$(get_state "$ifc" IFB)
@@ -214,6 +203,11 @@ apply_one() {
   # shellcheck disable=SC2086
   if ! tc qdisc replace dev "$ifc" root "$qdisc" bandwidth "$r_eg" dual-dsthost ${CAKE_OPTS:-} 2>/dev/null; then
     bad "在 $ifc 上挂 $qdisc 失败（检查 CAKE_OPTS 是否合法）"
+    if [ "$cur" = "mq" ]; then
+      note "$ifc 根队列是 mq（多发送队列），若直接 replace 被拒，可降为单队列后重试："
+      note "    ethtool -l $ifc              # 先看当前队列数"
+      note "    ethtool -L $ifc combined 1   # 回滚：combined 改回原值"
+    fi
     logline "FAIL $ifc tc-replace opts=[${CAKE_OPTS:-}]"
     clear_state "$ifc"
     return 1
@@ -249,8 +243,8 @@ stop_one() {
   tc qdisc del dev "$ifc" root >/dev/null 2>&1
 
   case "$orig" in
-    "" | noqueue | null | cake | cake_mq | unknown)
-      ok "$ifc 已清除整形，内核将回落默认队列"
+    "" | noqueue | null | mq | cake | cake_mq | unknown)
+      ok "$ifc 已清除整形（内核会自动恢复默认队列）"
       ;;
     htb | tbf | hfsc | cbq | drr | qfq | pie | netem)
       note "$ifc 原队列是分层/有状态队列（$orig），无法自动重建其类与过滤器"

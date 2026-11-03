@@ -73,7 +73,7 @@ sudo cake-fairshare
 ## 交互菜单
 
 ```
-  CAKE 公平带宽分配 v2.2.0   Debian GNU/Linux 12 (bookworm)
+  CAKE 公平带宽分配 v2.2.1   Debian GNU/Linux 12 (bookworm)
 ------------------------------------------------------------
   状态：○ 未启用      网卡 eth0   带宽 95mbit   方向 both
 ------------------------------------------------------------
@@ -182,7 +182,7 @@ rm -rf /etc/cake-fairshare
 
 **同时有 IPv4 和 IPv6 呢？** tc 工作在 IP 层之下，v4/v6 共用同一个 qdisc，一定生效。但公平单位是 IP 而不是账号：一个用户双栈同时连接会被算成两个 host，拿两份份额。菜单第 8 项给了按前缀归并的方案。
 
-**报 `mq` 相关错误？** 网卡是多发送队列（virtio 常见），`cake` 不能直接挂 root。脚本会自动尝试 `cake_mq`；不支持时执行 `ethtool -L eth0 combined 1`（先 `ethtool -l eth0` 记下原值以便回滚）。
+**看到 `mq` 就以为挂不上？** 多队列网卡（virtio 常见）的根队列通常是 `mq`，但 `tc qdisc replace dev eth0 root cake` **是允许的**，它会整体替换掉 mq 及其叶子队列。只有在极老的内核上被拒时，才需要 `ethtool -L eth0 combined 1`（先 `ethtool -l eth0` 记下原值以便回滚）。
 
 **和面板限速是什么关系？** 不冲突，串联后取较小值：`实际速度 = min(套餐档位, 总带宽 / 在线人数)`。CAKE 负责兜底公平，面板限速负责区分套餐。
 
