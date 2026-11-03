@@ -18,7 +18,11 @@
 
 set -uo pipefail
 
-VERSION="2.3.0"
+VERSION="2.4.0"
+# ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
+# 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
+DEF_RATE="190mbit"
+DEF_CAKE_OPTS_INGRESS="ack-filter"
 CONF_DIR="/etc/cake-fairshare"
 CONF="${CONF_DIR}/config"
 UNIT="/etc/systemd/system/cake-fairshare.service"
@@ -113,8 +117,9 @@ normalize_rate() {
 
 # ------------------------------------------------------------ 配置与状态 ----
 load_conf() {
-  IFACES=""; RATE="95mbit"; MODE="both"
-  RATE_EGRESS=""; RATE_INGRESS=""; CAKE_OPTS=""; CAKE_OPTS_INGRESS=""
+  IFACES=""; RATE="$DEF_RATE"; MODE="both"
+  RATE_EGRESS=""; RATE_INGRESS=""
+  CAKE_OPTS=""; CAKE_OPTS_INGRESS="$DEF_CAKE_OPTS_INGRESS"
   # shellcheck disable=SC1090
   if [ -r "$CONF" ]; then . "$CONF"; fi
 }
@@ -434,6 +439,11 @@ show_env() {
   say "  网卡"
   local def ifc mark v6tag
   def=$(primary_iface)
+  i=0
+  for ifc in $ifc_list; do
+    i=$((i + 1))
+    [ "$ifc" = "$def" ] && def_idx=$i
+  done
   for ifc in $(list_ifaces); do
     mark=""
     [ "$ifc" = "$def" ] && mark=" ${G}<- 默认路由${R}"
@@ -511,7 +521,7 @@ monitor() {
 
 # ---------------------------------------------------------------- 菜单动作 ----
 menu_enable() {
-  local ifc_list def sel rate mode confirm chosen n pick ifc i
+  local ifc_list def sel rate mode confirm chosen n pick ifc i ack def_idx=1
   ifc_list=$(list_ifaces)
   if [ -z "$ifc_list" ]; then bad "没有可用的物理网卡"; pause; return 1; fi
   def=$(primary_iface)
@@ -539,8 +549,8 @@ menu_enable() {
   done
   say "  a) 全部网卡（v4/v6 分属不同网卡时选这个）"
   hr
-  read -rp "选择网卡 [默认 1]（可输入 1 2 或 a）: " sel
-  sel=${sel:-1}
+  read -rp "选择网卡 [默认 ${def_idx}]（可输入 1 2 或 a）: " sel
+  sel=${sel:-$def_idx}
 
   chosen=""
   if [ "$sel" = "a" ] || [ "$sel" = "A" ]; then
@@ -554,8 +564,8 @@ menu_enable() {
   fi
   chosen=$(printf '%s' "$chosen" | tr -s ' ' | sed 's/^ //; s/ $//')
 
-  read -rp "总带宽（如 95mbit / 100M / 1gbit）[默认 95mbit]: " rate
-  rate=$(normalize_rate "${rate:-95mbit}") || { bad "带宽格式无法识别"; pause; return 1; }
+  read -rp "总带宽（95/100M/1gbit，按套餐峰值打 95%）[默认 ${DEF_RATE}]: " rate
+  rate=$(normalize_rate "${rate:-$DEF_RATE}") || { bad "带宽格式无法识别"; pause; return 1; }
 
   say ""
   say "  限制方向："
@@ -563,6 +573,15 @@ menu_enable() {
   say "    2) 只限下行（CPU 更省，仅整形出口）"
   read -rp "  选择 [默认 1]: " mode
   if [ "${mode:-1}" = "2" ]; then mode="down"; else mode="both"; fi
+
+  # 只在还没有自定义 cake 参数时才询问，避免覆盖第 9 项的设置
+  if [ -z "${CAKE_OPTS_INGRESS:-}" ]; then
+    read -rp "  启用 ack-filter 压缩上行 ACK（跨国链路推荐）？[Y/n]: " ack
+    case "${ack:-Y}" in
+      n | N) CAKE_OPTS_INGRESS="" ;;
+      *) CAKE_OPTS_INGRESS="ack-filter" ;;
+    esac
+  fi
 
   say ""
   say "${B}即将执行${R}"
@@ -635,22 +654,12 @@ menu_stop() {
   pause
 }
 
-menu_service() {
-  local act
-  say ""
-  say "  1) 安装并开启开机自启"
-  say "  2) 关闭并移除自启"
-  say "  3) 查看服务状态"
-  read -rp "选择 [默认 1]: " act
-  case "${act:-1}" in
-    1)
-      if [ ! -x "$SELF_INSTALL" ]; then
-        note "先把脚本安装到 $SELF_INSTALL"
-        install -m 0755 "$0" "$SELF_INSTALL" || { bad "安装失败"; pause; return 1; }
-        ok "已安装：$SELF_INSTALL"
-      fi
-      if [ ! -r "$CONF" ]; then bad "还没有配置，请先执行第 2 项"; pause; return 1; fi
-      cat >"$UNIT" <<'EOF'
+install_service() {
+  if [ ! -x "$SELF_INSTALL" ]; then
+    install -m 0755 "$0" "$SELF_INSTALL" 2>/dev/null || return 1
+  fi
+  [ -r "$CONF" ] || return 1
+  cat >"$UNIT" <<'EOF'
 [Unit]
 Description=CAKE fair-share bandwidth shaper
 Documentation=man:tc-cake(8)
@@ -668,8 +677,56 @@ TimeoutStartSec=30
 [Install]
 WantedBy=multi-user.target
 EOF
-      systemctl daemon-reload
-      if systemctl enable --now cake-fairshare >/dev/null 2>&1; then
+  systemctl daemon-reload
+  systemctl enable --now cake-fairshare >/dev/null 2>&1
+}
+
+do_init() {
+  local rate ifc
+  rate=$(normalize_rate "${1:-$DEF_RATE}") || die "带宽格式无法识别：${1:-}"
+  ifc=$(primary_iface)
+  [ -n "$ifc" ] || die "找不到默认路由网卡，请手动用菜单第 2 项配置"
+  require_root
+
+  if [ -r "$CONF" ]; then
+    cp "$CONF" "${CONF}.bak.$(date +%Y%m%d%H%M%S)"
+    note "已备份原配置"
+  fi
+  IFACES="$ifc"; RATE="$rate"; MODE="both"
+  RATE_EGRESS=""; RATE_INGRESS=""
+  CAKE_OPTS=""; CAKE_OPTS_INGRESS="$DEF_CAKE_OPTS_INGRESS"
+  save_conf
+  ok "配置：网卡 $IFACES  带宽 $RATE  方向 both  入口参数 ${CAKE_OPTS_INGRESS:-无}"
+
+  say ""
+  preflight || note "上面这些冲突项未自动处理，需要的话运行菜单第 2 项"
+
+  say ""
+  do_apply || die "启用失败，见上方提示"
+  say ""
+  if install_service; then
+    ok "已设置开机自启（cake-fairshare.service）"
+  else
+    bad "开机自启设置失败，可稍后用菜单第 6 项"
+  fi
+
+  say ""
+  say "下一步（可选）："
+  dim "  cake-fairshare          # 菜单第 10 项开启每分钟采样"
+  dim "  cake-fairshare check    # 现场诊断"
+}
+
+menu_service() {
+  local act
+  say ""
+  say "  1) 安装并开启开机自启"
+  say "  2) 关闭并移除自启"
+  say "  3) 查看服务状态"
+  read -rp "选择 [默认 1]: " act
+  case "${act:-1}" in
+    1)
+      [ -r "$CONF" ] || { bad "还没有配置，请先执行第 2 项"; pause; return 1; }
+      if install_service; then
         ok "服务已启用并启动"
         systemctl --no-pager --lines=0 status cake-fairshare 2>/dev/null | sed 's/^/  /'
       else
@@ -1020,6 +1077,7 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare log            采样一次（供 systemd timer 调用）
   cake-fairshare report [N]     查看最近 N 条采样
   cake-fairshare check          现场诊断（判断是否自身占满）
+  cake-fairshare init [带宽]    用默认参数一键配置并启用（新机器用这个）
   cake-fairshare preflight      只检查环境，不改任何东西
   cake-fairshare --help
 
@@ -1040,6 +1098,7 @@ case "${1:-}" in
   report)         require_root; show_report "${2:-30}" ;;
   check)          require_root; load_conf; diagnose "${2:-}" ;;
   preflight)      require_root; preflight ;;
+  init)           load_conf; do_init "${2:-}" ;;
   -h|--help|help) usage ;;
   *)              usage; exit 1 ;;
 esac

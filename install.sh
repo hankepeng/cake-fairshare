@@ -45,5 +45,10 @@ fi
 install -m 0755 "$tmp" "$TARGET"
 echo ">> 已安装到 ${TARGET}"
 echo
-echo "下一步："
-echo "  sudo cake-fairshare        # 打开交互菜单，选 1 自检 → 2 启用"
+echo "下一步（二选一）："
+echo "  sudo cake-fairshare init        # 一键：默认参数 + 开机自启"
+echo "  sudo cake-fairshare             # 交互菜单：1 自检 → 2 启用 → 6 自启"
+echo
+echo "默认带宽 ${DEF_HINT:-190mbit}（对应 200M 峰值套餐），其他套餐用："
+echo "  sudo cake-fairshare init 95mbit    # 100M 套餐"
+echo "  sudo cake-fairshare init 28mbit    # 30M 套餐"

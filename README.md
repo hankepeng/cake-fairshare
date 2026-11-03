@@ -57,23 +57,56 @@ tc qdisc replace dev ifb0 root cake bandwidth 95mbit dual-srchost
 ## 快速开始
 
 ```bash
-# 方式一：一键安装（需 root）
+# 一键安装 + 一键配置（推荐）
 bash <(curl -fsSL https://raw.githubusercontent.com/hankepeng/cake-fairshare/main/install.sh)
-sudo cake-fairshare
+sudo cake-fairshare init
+```
 
-# 方式二：手动
+`init` 会做四件事：按默认参数生成配置、跑一次环境预检、立即启用整形、设置开机自启。全程无交互。
+
+默认参数就是**为境外代理节点准备的**：
+
+| 项 | 默认值 | 说明 |
+|---|---|---|
+| 网卡 | 默认路由那块 | 无需指定，多网卡机器才需要手选 |
+| 带宽 | `190mbit` | 对应 200M 峰值套餐（95% 留余量） |
+| 方向 | `both` | 上下行都整形 |
+| 入口参数 | `ack-filter` | 压缩上行纯 ACK，跨国链路提升有效吞吐 |
+
+其他套餐直接传参：
+
+```bash
+sudo cake-fairshare init 95mbit     # 100M 峰值套餐
+sudo cake-fairshare init 28mbit     # 30M 峰值套餐
+sudo cake-fairshare init 475mbit    # 500M 峰值套餐
+```
+
+想改**默认值本身**（比如你所有机器都是 100M），改脚本头部两行即可，之后 `init` 不带参数就是你的标准：
+
+```bash
+DEF_RATE="95mbit"
+DEF_CAKE_OPTS_INGRESS="ack-filter"
+```
+
+需要更细的控制（指定网卡、只限下行、自定义 cake 参数）时再走交互菜单：
+
+```bash
+sudo cake-fairshare      # 1 自检 → 2 启用 → 6 自启
+```
+
+手动安装：
+
+```bash
 git clone https://github.com/hankepeng/cake-fairshare.git
 cd cake-fairshare
 sudo install -m 0755 cake-fairshare.sh /usr/local/sbin/cake-fairshare
-sudo cake-fairshare
+sudo cake-fairshare init
 ```
-
-进入菜单 → 选 `1` 自检 → 选 `2` 启用（带宽填实测值的 **95%** 左右）→ 选 `6` 开启开机自启。
 
 ## 交互菜单
 
 ```
-  CAKE 公平带宽分配 v2.3.0   Debian GNU/Linux 12 (bookworm)
+  CAKE 公平带宽分配 v2.4.0   Debian GNU/Linux 12 (bookworm)
 ------------------------------------------------------------
   状态：○ 未启用      网卡 eth0   带宽 95mbit   方向 both
 ------------------------------------------------------------
@@ -106,6 +139,7 @@ cake-fairshare log              # 采样一次（供 timer 调用）
 cake-fairshare report [N]       # 查看最近 N 条采样
 cake-fairshare check            # 现场诊断：判断是自身占满还是链路问题
 cake-fairshare preflight        # 只检查环境冲突，不做任何改动
+cake-fairshare init [带宽]      # 用默认参数一键配置 + 启用 + 开机自启
 ```
 
 ## 环境预检与自动清理
