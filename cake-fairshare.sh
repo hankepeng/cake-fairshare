@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.0.0"
+VERSION="2.0.1"
 CONF_DIR="/etc/cake-fairshare"
 CONF="${CONF_DIR}/config"
 UNIT="/etc/systemd/system/cake-fairshare.service"
@@ -154,10 +154,10 @@ is_active() {
 # ---------------------------------------------------------------- 核心动作 ----
 apply_one() {
   local ifc="$1" rate="$2" mode="$3"
-  local qdisc="cake" orig ifb="" idx=0
+  local qdisc="cake" orig cur prev_orig prev_ifb ifb="" idx=0
 
-  orig=$(root_qdisc "$ifc")
-  if [ "$orig" = "mq" ]; then
+  cur=$(root_qdisc "$ifc")
+  if [ "$cur" = "mq" ]; then
     if cake_mq_supported; then
       qdisc="cake_mq"
       ok "$ifc 为多队列网卡，改用 cake_mq"
@@ -170,6 +170,31 @@ apply_one() {
       return 1
     fi
   fi
+
+  prev_orig=$(get_state "$ifc" ORIG_QDISC)
+  prev_ifb=$(get_state "$ifc" IFB)
+
+  # 先拆掉 ingress 与上一轮的 ifb，再回收所有挂着 cake 的历史 ifb 设备，
+  # 否则反复 apply 或状态丢失时会堆出一排孤儿设备（它们不承载流量，但会干扰排查）
+  tc qdisc del dev "$ifc" ingress >/dev/null 2>&1
+  if [ -n "$prev_ifb" ]; then ip link del "$prev_ifb" >/dev/null 2>&1; fi
+  local dev
+  for dev in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^ifb[0-9]+$/ {print $2}'); do
+    if [ "$(root_qdisc "$dev")" = "cake" ]; then
+      ip link del "$dev" >/dev/null 2>&1
+    fi
+  done
+
+  # 原始 qdisc 只记录第一次，后续 apply 不能把 cake 自己当成"原始值"
+  orig="$prev_orig"
+  case "$orig" in
+    "" | cake | cake_mq)
+      case "$cur" in
+        cake | cake_mq) orig="${orig:-unknown}" ;;
+        *) orig="$cur" ;;
+      esac
+      ;;
+  esac
 
   clear_state "$ifc"
   put_state "$ifc" ORIG_QDISC "$orig"
@@ -207,18 +232,24 @@ stop_one() {
 
   tc qdisc del dev "$ifc" ingress >/dev/null 2>&1
   if [ -n "$ifb" ]; then ip link del "$ifb" >/dev/null 2>&1; fi
+  tc qdisc del dev "$ifc" root >/dev/null 2>&1
 
-  if [ -n "$orig" ] && [ "$orig" != "mq" ] && [ "$orig" != "noqueue" ]; then
-    if tc qdisc replace dev "$ifc" root "$orig" 2>/dev/null; then
-      ok "$ifc 已恢复原 qdisc：$orig"
-    else
-      tc qdisc del dev "$ifc" root >/dev/null 2>&1
-      note "$ifc 恢复 $orig 失败，已清空根队列（内核将回落默认值）"
-    fi
-  else
-    tc qdisc del dev "$ifc" root >/dev/null 2>&1
-    ok "$ifc 已清除整形"
-  fi
+  case "$orig" in
+    "" | noqueue | null | cake | cake_mq | unknown)
+      ok "$ifc 已清除整形，内核将回落默认队列"
+      ;;
+    htb | tbf | hfsc | cbq | drr | qfq | pie | netem)
+      note "$ifc 原队列是分层/有状态队列（$orig），无法自动重建其类与过滤器"
+      note "若仍需要它，请用原工具重新应用，例如： systemctl enable --now bandwidth-limit"
+      ;;
+    *)
+      if tc qdisc replace dev "$ifc" root "$orig" 2>/dev/null; then
+        ok "$ifc 已恢复原 qdisc：$orig"
+      else
+        note "$ifc 恢复 $orig 失败，已回落内核默认队列"
+      fi
+      ;;
+  esac
   clear_state "$ifc"
 }
 
