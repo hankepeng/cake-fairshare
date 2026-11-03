@@ -18,12 +18,15 @@
 
 set -uo pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 CONF_DIR="/etc/cake-fairshare"
 CONF="${CONF_DIR}/config"
 UNIT="/etc/systemd/system/cake-fairshare.service"
 SELF_INSTALL="/usr/local/sbin/cake-fairshare"
 LOG_FILE="/var/log/cake-fairshare.log"
+SAMPLE_LOG="/var/log/cake-fairshare-sample.log"
+SAMPLE_STATE="/var/lib/cake-fairshare/last"
+LOG_UNIT="/etc/systemd/system/cake-fairshare-log.service"
 
 if [ -t 1 ]; then
   R=$'\033[0m'; B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; RD=$'\033[31m'; C=$'\033[36m'; D=$'\033[2m'
@@ -639,6 +642,176 @@ menu_advanced() {
   pause
 }
 
+# ------------------------------------------------------------ 采样与诊断 ----
+unit_num() { printf '%s' "$1" | grep -oE '[0-9]+' | head -n1; }
+
+iface_counters() {
+  awk -v d="$1:" '$1==d {print $2, $10}' /proc/net/dev
+}
+
+qdisc_stat() {
+  tc -s qdisc show dev "$1" 2>/dev/null | grep -oE "$2 [0-9]+" | head -n1 | awk '{print $2}'
+}
+
+trim_log() {
+  [ -f "$SAMPLE_LOG" ] || return 0
+  local n
+  n=$(wc -l <"$SAMPLE_LOG" 2>/dev/null || echo 0)
+  if [ "$n" -gt 30000 ]; then
+    tail -n 20000 "$SAMPLE_LOG" >"${SAMPLE_LOG}.tmp" && mv "${SAMPLE_LOG}.tmp" "$SAMPLE_LOG"
+  fi
+}
+
+sample_once() {
+  load_conf
+  local ifc now rx tx lts lrx ltx dt ifb
+  ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
+  [ -n "$ifc" ] || return 1
+  read -r rx tx < <(iface_counters "$ifc")
+  [ -n "${rx:-}" ] || return 1
+
+  now=$(date +%s)
+  mkdir -p "$(dirname "$SAMPLE_STATE")" "$(dirname "$SAMPLE_LOG")" 2>/dev/null
+  if [ -r "$SAMPLE_STATE" ]; then read -r lts lrx ltx <"$SAMPLE_STATE"; fi
+  printf '%s %s %s\n' "$now" "$rx" "$tx" >"${SAMPLE_STATE}.tmp" && mv "${SAMPLE_STATE}.tmp" "$SAMPLE_STATE"
+
+  [ -n "${lts:-}" ] || return 0
+  dt=$((now - lts))
+  [ "$dt" -gt 0 ] || return 0
+  [ "$rx" -ge "${lrx:-0}" ] || return 0
+
+  local rx_m tx_m eo ed io cn
+  rx_m=$(awk -v a="$lrx" -v b="$rx" -v t="$dt" 'BEGIN{printf "%.2f",(b-a)*8/t/1000000}')
+  tx_m=$(awk -v a="$ltx" -v b="$tx" -v t="$dt" 'BEGIN{printf "%.2f",(b-a)*8/t/1000000}')
+  eo=$(qdisc_stat "$ifc" overlimits)
+  ed=$(qdisc_stat "$ifc" dropped)
+  ifb=$(get_state "$ifc" IFB)
+  io=""
+  [ -n "$ifb" ] && io=$(qdisc_stat "$ifb" overlimits)
+  cn=$(ss -Htn state established 2>/dev/null | wc -l | tr -d ' ')
+
+  printf '%s,%s,%s,%s,%s,%s,%s\n' "$(date '+%F %T')" "$rx_m" "$tx_m" \
+    "${eo:-0}" "${ed:-0}" "${io:-0}" "${cn:-0}" >>"$SAMPLE_LOG"
+  trim_log
+}
+
+show_report() {
+  local n="${1:-30}"
+  if [ ! -r "$SAMPLE_LOG" ]; then note "还没有采样数据，先执行采样开启（菜单第 10 项）"; return 1; fi
+  say ""
+  say "${B}最近 $n 条采样${R}（每分钟一次，下行=出口 上行=入口）"
+  hr
+  printf '  %-19s %10s %10s %8s %8s\n' "时间" "下行Mbps" "上行Mbps" "出口超限" "连接数"
+  tail -n "$n" "$SAMPLE_LOG" | awk -F, '{
+    printf "  %-19s %10.1f %10.1f %8s %8s\n", $1, $2, $3, $4, $7
+  }'
+  hr
+  awk -F, 'BEGIN{mn=99999} {if($2+0<mn)mn=$2+0; if($2+0>mx)mx=$2+0; s+=$2+0; c++}
+    END{if(c>0) printf "  下行 最小 %.1f / 平均 %.1f / 最大 %.1f Mbps（%d 个样本）\n", mn, s/c, mx, c}' \
+    <(tail -n "$n" "$SAMPLE_LOG")
+}
+
+diagnose() {
+  load_conf
+  local ifc="${1:-}"
+  [ -n "$ifc" ] || ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
+  [ -n "$ifc" ] || { note "尚未配置网卡"; return 1; }
+
+  local ifb egr ing r1 t1 r2 t2 rx_m tx_m pct eo ed
+  ifb=$(get_state "$ifc" IFB)
+  egr=$(unit_num "${RATE_EGRESS:-$RATE}")
+  ing=$(unit_num "${RATE_INGRESS:-$RATE}")
+
+  read -r r1 t1 < <(iface_counters "$ifc")
+  sleep 1
+  read -r r2 t2 < <(iface_counters "$ifc")
+  tx_m=$(awk -v a="$t1" -v b="$t2" 'BEGIN{if(b>=a) printf "%.1f",(b-a)*8/1000000; else print "0"}')
+  rx_m=$(awk -v a="$r1" -v b="$r2" 'BEGIN{if(b>=a) printf "%.1f",(b-a)*8/1000000; else print "0"}')
+  pct=$(awk -v v="$tx_m" -v c="$egr" 'BEGIN{if(c>0) printf "%d", v*100/c; else print 0}')
+  eo=$(qdisc_stat "$ifc" overlimits)
+  ed=$(qdisc_stat "$ifc" dropped)
+
+  say ""
+  say "${B}现场诊断  $ifc${R}"
+  hr
+  printf '  当前下行（出口） : %s Mbps   上限 %s Mbps   占用 %s%%\n' "$tx_m" "$egr" "$pct"
+  printf '  当前上行（入口） : %s Mbps   上限 %s Mbps\n' "$rx_m" "$ing"
+  printf '  出口累计超限包数 : %s\n' "${eo:-?}"
+  printf '  出口累计丢弃包数 : %s\n' "${ed:-?}"
+  hr
+  say "  当前连接数最多的对端（前 5）"
+  ss -Htn state established 2>/dev/null | awk '{print $NF}' \
+    | sed -E 's/:[0-9]+$//' | sort | uniq -c | sort -rn | head -5 | sed 's/^/    /'
+  hr
+  if [ "$pct" -ge 85 ]; then
+    ok "链路已接近整形上限：此时测速偏低属正常，是自己在占用带宽"
+  elif [ "$pct" -ge 40 ]; then
+    note "带宽有一半左右在跑，速度还不理想的话看连接数是否分散"
+  else
+    bad "本机几乎空闲却慢 —— 整形不是瓶颈，问题在上游链路、跨境路由或平台侧限速"
+    dim "  排查顺序： ping/mtr 到客户端 → 看是否晚高峰 → 对比历史采样日志"
+  fi
+}
+
+menu_log() {
+  local act n
+  say ""
+  say "  采样日志：每分钟记录一次上行/下行实速与队列统计，用于事后判断是否被平台限速"
+  hr
+  say "  1) 开启每分钟采样"
+  say "  2) 关闭采样"
+  say "  3) 查看最近记录"
+  say "  4) 立即诊断（我现在占满没有）"
+  read -rp "选择 [默认 1]: " act
+  case "${act:-1}" in
+    1)
+      cat >"$LOG_UNIT" <<'EOF'
+[Unit]
+Description=CAKE fair-share bandwidth sampling
+After=cake-fairshare.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cake-fairshare log
+EOF
+      cat >"${LOG_UNIT%.service}.timer" <<'EOF'
+[Unit]
+Description=Sample CAKE bandwidth every minute
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=cake-fairshare-log.service
+
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl daemon-reload
+      if systemctl enable --now cake-fairshare-log.timer >/dev/null 2>&1; then
+        ok "已开启，每分钟采样一次（日志：$SAMPLE_LOG）"
+        dim "  首次采样在 90 秒后，第二分钟起才有速率数据"
+      else
+        bad "启动失败，排查： systemctl status cake-fairshare-log.timer"
+      fi
+      ;;
+    2)
+      systemctl disable --now cake-fairshare-log.timer >/dev/null 2>&1
+      rm -f "${LOG_UNIT%.service}.timer" "$LOG_UNIT"
+      systemctl daemon-reload
+      ok "已关闭采样（历史日志保留在 $SAMPLE_LOG）"
+      ;;
+    3)
+      read -rp "看最近多少条 [默认 30]: " n
+      show_report "${n:-30}"
+      ;;
+    4)
+      diagnose
+      ;;
+  esac
+  pause
+}
+
 # ---------------------------------------------------------------- 主菜单 ----
 draw_menu() {
   clear
@@ -665,6 +838,7 @@ draw_menu() {
   say "  7) 调整带宽"
   say "  8) IPv6 与多 IP 用户说明（进阶）"
   say "  9) 高级参数（cake 选项 / 上下行分别限速）"
+  say " 10) 采样日志与现场诊断"
   say "  0) 退出"
   hr
 }
@@ -674,7 +848,7 @@ main_menu() {
   local choice
   while true; do
     draw_menu
-    read -rp "  请输入编号: " choice
+    read -rp "  请输入编号: " choice || { say ""; exit 0; }
     case "$choice" in
       1) show_env; pause ;;
       2) menu_enable ;;
@@ -685,6 +859,7 @@ main_menu() {
       7) menu_rate ;;
       8) menu_advice ;;
       9) menu_advanced ;;
+      10) menu_log ;;
       0|q|Q) say ""; exit 0 ;;
       *) note "无效输入"; sleep 1 ;;
     esac
@@ -700,6 +875,9 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare stop           撤销整形并恢复原 qdisc
   cake-fairshare status         状态快照
   cake-fairshare monitor [网卡] 实时监控
+  cake-fairshare log            采样一次（供 systemd timer 调用）
+  cake-fairshare report [N]     查看最近 N 条采样
+  cake-fairshare check          现场诊断（判断是否自身占满）
   cake-fairshare --help
 
 配置：${CONF}
@@ -714,6 +892,10 @@ case "${1:-}" in
   stop)           require_root; do_stop ;;
   status)         require_root; show_status ;;
   monitor)        require_root; load_conf; monitor "${2:-}" ;;
+  log)            require_root; sample_once ;;
+  sample)         require_root; sample_once ;;
+  report)         require_root; show_report "${2:-30}" ;;
+  check)          require_root; load_conf; diagnose "${2:-}" ;;
   -h|--help|help) usage ;;
   *)              usage; exit 1 ;;
 esac

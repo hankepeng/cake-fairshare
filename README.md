@@ -73,7 +73,7 @@ sudo cake-fairshare
 ## 交互菜单
 
 ```
-  CAKE 公平带宽分配 v2.1.0   Debian GNU/Linux 12 (bookworm)
+  CAKE 公平带宽分配 v2.2.0   Debian GNU/Linux 12 (bookworm)
 ------------------------------------------------------------
   状态：○ 未启用      网卡 eth0   带宽 95mbit   方向 both
 ------------------------------------------------------------
@@ -86,6 +86,7 @@ sudo cake-fairshare
   7) 调整带宽
   8) IPv6 与多 IP 用户说明（进阶）
   9) 高级参数（cake 选项 / 上下行分别限速）
+ 10) 采样日志与现场诊断
   0) 退出
 ```
 
@@ -101,7 +102,39 @@ cake-fairshare apply            # 按配置启用（无交互，systemd 使用�
 cake-fairshare stop             # 撤销整形，恢复启用前的 qdisc
 cake-fairshare status           # 快照
 cake-fairshare monitor [网卡]   # 实时监控
+cake-fairshare log              # 采样一次（供 timer 调用）
+cake-fairshare report [N]       # 查看最近 N 条采样
+cake-fairshare check            # 现场诊断：判断是自身占满还是链路问题
 ```
+
+## 采样日志与诊断
+
+带宽跑不满时，最难的是判断"是自己占满了"还是"上游/平台限速"。菜单第 10 项装一个每分钟采样一次的 timer，把答案留成数据：
+
+```bash
+cake-fairshare          # 第 10 项 → 1 开启
+cake-fairshare report   # 事后回看
+cake-fairshare check    # 事发时现场判断
+```
+
+日志是 CSV，一行一分钟：
+
+```
+2026-11-04 05:00:37,0.01,0.01,64389,1,55,6
+    时间            下行   上行  出口超限 丢弃 入口超限 连接数
+```
+
+`check` 会做三件事：1 秒实测当前上下行、与整形上限对比算占用率、列出连接数最多的对端 IP，然后直接给结论——
+
+| 占用率 | 结论 |
+|---|---|
+| ≥ 85% | 链路已饱和，测速偏低是自己在占用，正常 |
+| 40~85% | 部分占用，看连接是否分散 |
+| < 40% | 本机空闲却慢 → 问题在上游链路、跨境路由或平台限速 |
+
+有了这条基线，下次再遇到"只有 1-3M"，先 `check` 一眼就能定性，不用靠回忆。
+
+日志超过 30000 行会自动裁到 20000 行（约 20 天），不用配 logrotate。
 
 ## 文件位置
 
@@ -111,7 +144,10 @@ cake-fairshare monitor [网卡]   # 实时监控
 | `/etc/cake-fairshare/config` | 网卡 / 带宽 / 方向 / 高级参数 |
 | `/etc/cake-fairshare/state.<网卡>` | 启用前的 qdisc 与 ifb 名，用于精确回滚 |
 | `/etc/systemd/system/cake-fairshare.service` | 开机自启单元（菜单第 6 项生成） |
+| `/etc/systemd/system/cake-fairshare-log.{service,timer}` | 采样定时器（菜单第 10 项生成） |
 | `/var/log/cake-fairshare.log` | apply / stop / 失败原因 |
+| `/var/log/cake-fairshare-sample.log` | 每分钟采样 CSV |
+| `/var/lib/cake-fairshare/last` | 上次采样的计数器基线 |
 
 配置文件各字段：
 
