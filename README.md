@@ -73,7 +73,7 @@ sudo cake-fairshare
 ## 交互菜单
 
 ```
-  CAKE 公平带宽分配 v2.2.1   Debian GNU/Linux 12 (bookworm)
+  CAKE 公平带宽分配 v2.3.0   Debian GNU/Linux 12 (bookworm)
 ------------------------------------------------------------
   状态：○ 未启用      网卡 eth0   带宽 95mbit   方向 both
 ------------------------------------------------------------
@@ -105,6 +105,28 @@ cake-fairshare monitor [网卡]   # 实时监控
 cake-fairshare log              # 采样一次（供 timer 调用）
 cake-fairshare report [N]       # 查看最近 N 条采样
 cake-fairshare check            # 现场诊断：判断是自身占满还是链路问题
+cake-fairshare preflight        # 只检查环境冲突，不做任何改动
+```
+
+## 环境预检与自动清理
+
+新机器上往往已经躺着别的限速脚本（`wondershaper`、各种一键 htb 脚本）。它们和 cake 抢同一个根队列，开机时谁后跑谁生效，出问题时极难归因。菜单第 2 项在启用前会先做一次预检：
+
+```bash
+cake-fairshare preflight    # 只检查，不改动任何东西
+```
+
+检查项：
+
+- 根队列不是 cake（`htb`/`tbf`/`hfsc`/`netem`…）
+- 残留的 `ifb` 设备挂着别的队列
+- **已启用、且会执行 tc 命令的 systemd 服务**——注意 unit 文件本身通常不含 tc 命令，真正的命令在 `ExecStart` 指向的脚本里，所以预检会顺着 `ExecStart` 去 grep
+- `/etc/rc.local` 与 root 的 crontab 里的 tc 命令
+
+发现冲突时会问你一句，同意后自动 `systemctl disable --now` 对应服务、删掉残留 ifb，并把停用过的服务名记到 `/etc/cake-fairshare/disabled-units`，方便随时恢复：
+
+```bash
+systemctl enable --now <被停用的服务名>
 ```
 
 ## 采样日志与诊断

@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.2.1"
+VERSION="2.3.0"
 CONF_DIR="/etc/cake-fairshare"
 CONF="${CONF_DIR}/config"
 UNIT="/etc/systemd/system/cake-fairshare.service"
@@ -127,10 +127,10 @@ save_conf() {
     printf 'RATE="%s"\n' "$RATE"
     printf 'MODE="%s"\n' "$MODE"
     printf '# 下面四项留空表示不启用；菜单第 9 项可直接改\n'
-    printf 'RATE_EGRESS="%s"\n' "$RATE_EGRESS"
-    printf 'RATE_INGRESS="%s"\n' "$RATE_INGRESS"
-    printf 'CAKE_OPTS="%s"\n' "$CAKE_OPTS"
-    printf 'CAKE_OPTS_INGRESS="%s"\n' "$CAKE_OPTS_INGRESS"
+    printf 'RATE_EGRESS="%s"\n' "${RATE_EGRESS:-}"
+    printf 'RATE_INGRESS="%s"\n' "${RATE_INGRESS:-}"
+    printf 'CAKE_OPTS="%s"\n' "${CAKE_OPTS:-}"
+    printf 'CAKE_OPTS_INGRESS="%s"\n' "${CAKE_OPTS_INGRESS:-}"
   } >"$CONF"
 }
 
@@ -160,7 +160,126 @@ is_active() {
   return 1
 }
 
-# ---------------------------------------------------------------- 核心动作 ----
+# ------------------------------------------------------------ 环境预检 ----
+# 找出会在开机时改写根队列的服务：unit 文件本身通常不含 tc 命令，
+# 真正的命令在 ExecStart 指向的脚本里，所以必须顺着 ExecStart 去 grep。
+find_shaper_units() {
+  local u exe
+  for u in $(systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | awk '{print $1}'); do
+    case "$u" in
+      cake-fairshare* | systemd-* | ssh* | cron* | dbus* | getty* | user@* | rsyslog* | networking*) continue ;;
+    esac
+    exe=$(systemctl show -p ExecStart --value "$u" 2>/dev/null | grep -oE '/[^ ;"]+' | head -n1)
+    [ -n "$exe" ] || continue
+    [ -f "$exe" ] || continue
+    if grep -qsE 'tc (qdisc|class|filter)' "$exe"; then
+      printf '%s|%s\n' "$u" "$exe"
+    fi
+  done
+}
+
+# 返回 0 表示发现冲突，1 表示干净
+preflight() {
+  load_conf
+  local ifc q d out found=1
+  say ""
+  say "${B}环境预检${R}"
+  hr
+
+  for ifc in ${IFACES:-$(list_ifaces)}; do
+    ip link show "$ifc" >/dev/null 2>&1 || { bad "$ifc 不存在"; found=0; continue; }
+    q=$(root_qdisc "$ifc")
+    case "$q" in
+      cake) ok "$ifc 根队列已是 cake" ;;
+      mq) ok "$ifc 根队列 mq（多队列，可直接替换为 cake）" ;;
+      htb | tbf | hfsc | cbq | prio | netem | drr | qfq)
+        note "$ifc 根队列是 $q（将被 cake 替换）"
+        found=0
+        ;;
+      *) dim "  $ifc 根队列是 $q" ;;
+    esac
+  done
+
+  for d in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^ifb[0-9]+$/ {print $2}'); do
+    q=$(root_qdisc "$d")
+    case "$q" in
+      cake) dim "  $d 是本工具创建的（下次 apply 会复用/回收）" ;;
+      *)
+        note "$d 挂着 $q，像是其他限速工具留下的残留设备"
+        found=0
+        ;;
+    esac
+  done
+
+  out=$(find_shaper_units)
+  if [ -n "$out" ]; then
+    say "  以下已启用的服务会在启动时改写队列："
+    printf '%s\n' "$out" | while IFS= read -r line; do
+      note "${line%%|*}"
+      dim "     ${line#*|}"
+    done
+    found=0
+  fi
+
+  local f
+  for f in /root/bandwidth-limit.sh /root/vps-speed-limit /usr/local/sbin/wondershaper /usr/local/sbin/tc-limit; do
+    [ -f "$f" ] || continue
+    case "$out" in *"$f"*) continue ;; esac
+    grep -qsE 'tc (qdisc|class|filter)' "$f" || continue
+    dim "  发现历史限速脚本 $f（未随服务运行，留着无妨）"
+  done
+
+  if [ -f /etc/rc.local ] && grep -qsE 'tc (qdisc|class|filter)' /etc/rc.local; then
+    note "/etc/rc.local 里含 tc 命令，开机时会执行"
+    found=0
+  fi
+
+  if crontab -l 2>/dev/null | grep -qsE 'tc (qdisc|class|filter)'; then
+    note "root 的 crontab 里含 tc 命令"
+    found=0
+  fi
+
+  hr
+  if [ "$found" -eq 1 ]; then
+    ok "未发现会与 cake 抢根队列的东西"
+    return 0
+  fi
+  note "存在上述项目；启用时可以选择停用它们，为 cake 让路"
+  return 1
+}
+
+cleanup_conflicts() {
+  local out u exe d n=0
+  out=$(find_shaper_units)
+  if [ -n "$out" ]; then
+    while IFS= read -r line; do
+      u="${line%%|*}"
+      if systemctl disable --now "$u" >/dev/null 2>&1; then
+        ok "已停用并禁止自启：$u"
+        printf '%s\n' "$u" >>"${CONF_DIR}/disabled-units"
+        logline "DISABLE $u"
+        n=$((n + 1))
+      else
+        bad "停用 $u 失败（可能需要手动处理）"
+      fi
+    done <<EOF
+$out
+EOF
+  fi
+
+  for d in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^ifb[0-9]+$/ {print $2}'); do
+    [ "$(root_qdisc "$d")" = "cake" ] && continue
+    ip link del "$d" >/dev/null 2>&1 && { ok "已删除残留设备 $d"; n=$((n + 1)); }
+  done
+
+  if [ -s "${CONF_DIR}/disabled-units" ]; then
+    sort -u "${CONF_DIR}/disabled-units" -o "${CONF_DIR}/disabled-units"
+    dim "  恢复方式记在 ${CONF_DIR}/disabled-units，例如 systemctl enable --now <名字>"
+  fi
+  return 0
+}
+
+
 apply_one() {
   local ifc="$1" rate="$2" mode="$3"
   local qdisc="cake" orig cur prev_orig prev_ifb ifb="" idx=0
@@ -179,8 +298,16 @@ apply_one() {
   # 否则反复 apply 或状态丢失时会堆出一排孤儿设备（它们不承载流量，但会干扰排查）
   tc qdisc del dev "$ifc" ingress >/dev/null 2>&1
   if [ -n "$prev_ifb" ]; then ip link del "$prev_ifb" >/dev/null 2>&1; fi
-  local dev
+  # 回收本工具历史遗留的 ifb（根队列为 cake），但要避开其他已配置网卡正在用的那个，
+  # 否则多网卡场景下先配 eth0 会把 eth1 的入口设备删掉
+  local dev o o_ifb keep=""
+  for o in $IFACES; do
+    [ "$o" = "$ifc" ] && continue
+    o_ifb=$(get_state "$o" IFB)
+    [ -n "$o_ifb" ] && keep="$keep $o_ifb"
+  done
   for dev in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^ifb[0-9]+$/ {print $2}'); do
+    case " $keep " in *" $dev "*) continue ;; esac
     if [ "$(root_qdisc "$dev")" = "cake" ]; then
       ip link del "$dev" >/dev/null 2>&1
     fi
@@ -299,9 +426,9 @@ show_env() {
   if cake_supported; then printf '%b可用%b\n' "$G" "$R"; else printf '%b缺失（缺 sch_cake 模块）%b\n' "$RD" "$R"; fi
   printf '  cake_mq   : '
   if cake_mq_supported; then
-    printf '%b可用%b\n' "$G" "$R"
+    printf '%b可用%b %b（可选，本工具不依赖它）%b\n' "$G" "$R" "$D" "$R"
   else
-    printf '%b不可用%b %b（内核较旧；网卡单队列时不影响）%b\n' "$Y" "$R" "$D" "$R"
+    printf '%b不可用%b %b（可选，不影响使用）%b\n' "$D" "$R" "$D" "$R"
   fi
   hr
   say "  网卡"
@@ -318,7 +445,11 @@ show_env() {
   hr
   if [ -r "$CONF" ]; then
     load_conf
-    printf '  当前配置  : 网卡=%s  带宽=%s  方向=%s\n' "$IFACES" "$RATE" "$MODE"
+    if [ -z "${RATE_EGRESS:-}" ] && [ -z "${RATE_INGRESS:-}" ]; then
+      printf '  当前配置  : 网卡=%s  带宽=%s  方向=%s\n' "$IFACES" "$RATE" "$MODE"
+    else
+      printf '  当前配置  : 网卡=%s  下行=%s  上行=%s  方向=%s\n' "$IFACES" "${RATE_EGRESS:-$RATE}" "${RATE_INGRESS:-$RATE}" "$MODE"
+    fi
   else
     dim "  当前配置  : 尚未配置"
   fi
@@ -366,7 +497,7 @@ monitor() {
     t2=$(date +%s%N)
     read -r rx2 tx2 < <(awk -v d="$ifc" '$1==d":" {print $2, $10}' /proc/net/dev)
     dt=$(awk -v a="$t1" -v b="$t2" 'BEGIN{print (b-a)/1000000000}')
-    clear
+    if [ -t 1 ]; then clear; fi
     say "${B}实时监控  $ifc${R}   ${D}(Ctrl-C 退出)${R}"
     hr
     awk -v a="$rx1" -v b="$rx2" -v c="$tx1" -v d="$tx2" -v t="$dt" 'BEGIN{
@@ -384,6 +515,19 @@ menu_enable() {
   ifc_list=$(list_ifaces)
   if [ -z "$ifc_list" ]; then bad "没有可用的物理网卡"; pause; return 1; fi
   def=$(primary_iface)
+
+  # 先扫一遍环境：别的限速脚本/服务会和我们抢根队列，越早处理越好
+  if ! preflight; then
+    say ""
+    read -rp "  是否停用它们并清理残留，为 cake 让路？[Y/n]: " confirm
+    case "${confirm:-Y}" in
+      y | Y | "")
+        cleanup_conflicts
+        say ""
+        ;;
+      *) note "已跳过，冲突项会在开机时与 cake 互相覆盖" ;;
+    esac
+  fi
 
   say ""
   say "${B}可用网卡${R}"
@@ -444,7 +588,11 @@ menu_enable() {
   done
   say ""
   if [ "$rc" -eq 0 ]; then
-    ok "已启用：每人在线可占 ${rate} ÷ 当前在线客户端数"
+    if [ -z "${RATE_EGRESS:-}" ] && [ -z "${RATE_INGRESS:-}" ]; then
+      ok "已启用：上下行各 ${rate}，每人在线可占 ${rate} ÷ 在线客户端数"
+    else
+      ok "已启用：下行 ${RATE_EGRESS:-$rate} / 上行 ${RATE_INGRESS:-$rate}（第 9 项可调）"
+    fi
     dim "  验证：本菜单第 3/4 项"
   else
     note "部分网卡未成功，见上方提示"
@@ -808,7 +956,7 @@ EOF
 
 # ---------------------------------------------------------------- 主菜单 ----
 draw_menu() {
-  clear
+  if [ -t 1 ]; then clear; fi
   say ""
   printf '%b  CAKE 公平带宽分配 v%s%b   %b%s%b\n' "$B" "$VERSION" "$R" "$D" "$(os_pretty)" "$R"
   hr
@@ -818,7 +966,7 @@ draw_menu() {
     printf '  状态：%b○ 未启用%b' "$Y" "$R"
   fi
   if [ -r "$CONF" ]; then
-    printf '      网卡 %s   带宽 %s   方向 %s\n' "$IFACES" "$RATE" "$MODE"
+    printf '      网卡 %s   下行 %s / 上行 %s   方向 %s\n' "$IFACES" "${RATE_EGRESS:-$RATE}" "${RATE_INGRESS:-$RATE}" "$MODE"
   else
     printf '      尚未配置\n'
   fi
@@ -844,7 +992,7 @@ main_menu() {
     draw_menu
     read -rp "  请输入编号: " choice || { say ""; exit 0; }
     case "$choice" in
-      1) show_env; pause ;;
+      1) show_env; preflight; pause ;;
       2) menu_enable ;;
       3) show_status; pause ;;
       4) monitor ;;
@@ -872,6 +1020,7 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare log            采样一次（供 systemd timer 调用）
   cake-fairshare report [N]     查看最近 N 条采样
   cake-fairshare check          现场诊断（判断是否自身占满）
+  cake-fairshare preflight      只检查环境，不改任何东西
   cake-fairshare --help
 
 配置：${CONF}
@@ -890,6 +1039,7 @@ case "${1:-}" in
   sample)         require_root; sample_once ;;
   report)         require_root; show_report "${2:-30}" ;;
   check)          require_root; load_conf; diagnose "${2:-}" ;;
+  preflight)      require_root; preflight ;;
   -h|--help|help) usage ;;
   *)              usage; exit 1 ;;
 esac
