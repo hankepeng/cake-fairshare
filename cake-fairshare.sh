@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.6.0"
+VERSION="2.6.1"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -149,6 +149,7 @@ get_state() {
 }
 
 put_state() {
+  mkdir -p "$CONF_DIR" 2>/dev/null
   printf '%s=%s\n' "$2" "$3" >>"$(state_file "$1")"
 }
 
@@ -255,6 +256,7 @@ preflight() {
 
 cleanup_conflicts() {
   local out u exe d n=0
+  mkdir -p "$CONF_DIR" 2>/dev/null
   out=$(find_shaper_units)
   if [ -n "$out" ]; then
     while IFS= read -r line; do
@@ -498,9 +500,9 @@ monitor() {
   local ifc="${1:-}"
   [ -n "$ifc" ] || ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
   [ -n "$ifc" ] || { note "没有可用网卡"; return 1; }
-  local rx1 tx1 rx2 tx2 t1 t2 dt
-  trap 'printf "\n"; return 0' INT
-  while true; do
+  local rx1 tx1 rx2 tx2 t1 t2 dt stop=0
+  trap 'stop=1' INT
+  while [ "$stop" -eq 0 ]; do
     t1=$(date +%s%N)
     read -r rx1 tx1 < <(awk -v d="$ifc" '$1==d":" {print $2, $10}' /proc/net/dev)
     sleep 2
@@ -517,6 +519,8 @@ monitor() {
     hr
     tc -s qdisc show dev "$ifc" | sed 's/^/  /'
   done
+  trap - INT
+  say ""
 }
 
 # ---------------------------------------------------------------- 菜单动作 ----
@@ -853,7 +857,16 @@ menu_advanced() {
 }
 
 # ------------------------------------------------------------ 采样与诊断 ----
-unit_num() { printf '%s' "$1" | grep -oE '[0-9]+' | head -n1; }
+unit_num() {
+  local v n
+  v=$(printf '%s' "$1")
+  n=$(printf '%s' "$v" | grep -oE '[0-9]+' | head -n1)
+  [ -n "$n" ] || n=0
+  case "$v" in
+    *[Gg]*) n=$((n * 1000)) ;;
+  esac
+  printf '%s' "$n"
+}
 
 iface_counters() {
   awk -v d="$1:" '$1==d {print $2, $10}' /proc/net/dev
@@ -876,7 +889,8 @@ sample_once() {
   load_conf
   local ifc now rx tx lts lrx ltx dt ifb
   ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
-  [ -n "$ifc" ] || return 1
+  # 未配置时静默退出（返回 0），否则 timer 每分钟都会把 unit 记成 failed
+  [ -n "$ifc" ] || return 0
   read -r rx tx < <(iface_counters "$ifc")
   [ -n "${rx:-}" ] || return 1
 
@@ -1018,6 +1032,12 @@ health_report() {
   cap_e=$(unit_num "${RATE_EGRESS:-$RATE}")
   cap_i=$(unit_num "${RATE_INGRESS:-$RATE}")
   n=$(wc -l <"$SAMPLE_LOG")
+
+  if [ "$n" -lt 2 ]; then
+    note "采样数据只有 ${n} 条，还不够生成报告"
+    dim "  采样每分钟 1 条，跑十几分钟后再看就有内容了"
+    return 1
+  fi
 
   say ""
   say "${B}带宽健康报告${R}"

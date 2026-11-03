@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.6.1 — 2026-11-04
+
+定版前的代码审计（shellcheck 0 error / 0 warning + 人工逻辑审查 + 端到端回归）。
+
+### 修复
+
+- **`monitor` 的 Ctrl-C 会污染后续操作**：trap 里用 `return 0`，退出监控后 trap 仍留在进程里，回到菜单再按 Ctrl-C 会报 `can only return from a function`，且菜单不会退出。改用标志位 + `trap - INT`。
+- **`1gbit` 配置的百分比全错**：`unit_num` 只取数字，"1gbit" 被算成 1 Mbps，`check` / `health` 的占用率会除以 1，显示成几千 %。现在识别 `g` 单位并乘 1000。
+- **未配置时采样单元每分钟被判失败**：`sample_once` 无配置时返回 1，systemd 把 `cake-fairshare-log.service` 记成 failed。改为静默返回 0。
+- **配置目录不存在时写入报错**：`cleanup_conflicts` 可能早于 `save_conf` 执行，往不存在的 `/etc/cake-fairshare/` 追加 `disabled-units` 会打印 "No such file or directory"。两处补 `mkdir -p`。
+- 健康报告在样本不足 2 条时打印空白区间，改为友好提示。
+
+### 定版验证
+
+- `shellcheck -S warning`：0 error / 0 warning
+- 连续 3 次 `apply`：cake qdisc 恒为 2 个、ifb 恒为 1 个（无泄漏）
+- `systemctl restart`：退出码 0，队列完整重建
+- 删除整个 `/etc/cake-fairshare` 后用一行命令重装：配置、队列、服务、采样全部恢复
+- 子命令耗时：status 17ms / preflight 1.0s / check 1.0s / health 160ms / report 11ms / log 42ms
+
 ## v2.6.0 — 2026-11-04
 
 ### 新增
