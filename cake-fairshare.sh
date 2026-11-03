@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.5.0"
+VERSION="2.6.0"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -963,6 +963,117 @@ diagnose() {
   fi
 }
 
+
+# ------------------------------------------------------------ 健康报告 ----
+show_speedtest_history() {
+  local dir="${SPEEDTEST_DIR:-/root/speedtest_history}"
+  [ -d "$dir" ] || return 0
+  local files f ts dl ul maxdl
+  files=$(ls -1t "$dir"/* 2>/dev/null | head -12 | sort)
+  [ -n "$files" ] || return 0
+
+  local maxdl=0 maxul=0
+  for f in $files; do
+    dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    ul=$(grep -m1 'Upload:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    [ -n "$dl" ] || continue
+    maxdl=$(awk -v a="$maxdl" -v b="$dl" 'BEGIN{print (b>a)?b:a}')
+    [ -n "$ul" ] && maxul=$(awk -v a="$maxul" -v b="$ul" 'BEGIN{print (b>a)?b:a}')
+  done
+  awk -v m="$maxdl" 'BEGIN{exit !(m > 0)}' || return 0
+
+  ST_ALERTS=0
+  say ""
+  say "  ${B}历史测速记录${R} ${D}（$dir   基准：下行 ${maxdl} / 上行 ${maxul} Mbps）${R}"
+  for f in $files; do
+    ts=$(head -1 "$f" 2>/dev/null)
+    dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    ul=$(grep -m1 'Upload:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    [ -n "$dl" ] || continue
+    tag=""
+    if awk -v v="$dl" -v m="$maxdl" 'BEGIN{exit !(v < m*0.3)}'; then
+      tag="  <- 下行异常偏低"
+    fi
+    if [ -n "$ul" ] && awk -v v="$ul" -v m="$maxul" 'BEGIN{exit !(v < m*0.3)}'; then
+      if [ -n "$tag" ]; then tag="  <- 上下行都异常偏低"; else tag="  <- 上行异常偏低"; fi
+    fi
+    [ -n "$tag" ] && ST_ALERTS=$((ST_ALERTS + 1))
+    if [ -n "$tag" ]; then
+      printf '    %-18s 下行 %7s   上行 %7s Mbps   %b%s%b\n' "$ts" "$dl" "${ul:-?}" "$Y" "$tag" "$R"
+    else
+      printf '    %-18s 下行 %7s   上行 %7s Mbps\n' "$ts" "$dl" "${ul:-?}"
+    fi
+  done
+}
+
+health_report() {
+  load_conf
+  if [ ! -r "$SAMPLE_LOG" ]; then
+    note "还没有采样数据"
+    dim "  先到菜单第 10 项开启采样（每分钟记一次），累积几小时后这里就有报告了"
+    return 1
+  fi
+
+  local cap_e cap_i n
+  cap_e=$(unit_num "${RATE_EGRESS:-$RATE}")
+  cap_i=$(unit_num "${RATE_INGRESS:-$RATE}")
+  n=$(wc -l <"$SAMPLE_LOG")
+
+  say ""
+  say "${B}带宽健康报告${R}"
+  hr
+  printf '  整形上限：下行 %s Mbps / 上行 %s Mbps\n' "$cap_e" "$cap_i"
+  printf '  采样样本：%s 条（每分钟 1 条，约 %s 分钟）\n' "$n" "$n"
+  hr
+
+  awk -F, -v ce="$cap_e" -v ci="$cap_i" '
+    {
+      ts = $1; rx = $2 + 0; tx = $3 + 0; cn = $7 + 0
+      key = substr(ts, 1, 13)
+      if (!(key in seen)) { seen[key] = 1; order[++h] = key }
+      cnt[key]++
+      sr[key] += rx; st[key] += tx
+      if (tx > mx[key]) mx[key] = tx
+      if (rx > mr[key]) mr[key] = rx
+      if (cn > mc[key]) mc[key] = cn
+      if (tx > gmax) { gmax = tx; gmax_t = ts }
+      if (rx > gramax) gramax = rx
+      first = (first == "" ? ts : first)
+      last = ts
+    }
+    END {
+      printf "  %-13s %6s %8s %10s %10s %10s\n", "时段", "样本", "连接峰值", "下行峰值", "下行均值", "上行均值"
+      for (i = 1; i <= h; i++) {
+        k = order[i]
+        flag = ""
+        if (cnt[k] >= 5 && mc[k] >= 3 && mx[k] < ce * 0.2)
+          flag = sprintf("  <- %d 个连接但峰值仅 %.1f Mbps，疑似外部限制", mc[k], mx[k])
+        printf "  %-13s %6d %8d %10.1f %10.1f %10.1f%s\n", substr(k,6) ":00", cnt[k], mc[k], mx[k], st[k]/cnt[k], sr[k]/cnt[k], flag
+      }
+      printf "\n  记录区间：%s  ~  %s\n", first, last
+      printf "  下行峰值：%.1f Mbps（%s）\n", gmax, gmax_t
+      printf "  上行峰值：%.1f Mbps\n", gramax
+      if (gmax > ce * 1.05) printf "  %s\n", "注：峰值高于整形上限，说明该时段整形被临时关闭过（例如手动测速）"
+      else if (gmax < ce * 0.5) printf "  %s\n", "提示：峰值不到上限一半，可能是用户少，或上游本身跑不满"
+    }
+  ' "$SAMPLE_LOG"
+  hr
+
+  show_speedtest_history
+
+  say ""
+  hr
+  if [ "${ST_ALERTS:-0}" -eq 0 ]; then
+    ok "历史测速未发现异常，也没有「有连接但跑不动」的时段"
+  else
+    note "历史测速中有 ${ST_ALERTS} 次明显偏低（已用黄色标出），其余时间正常"
+    dim "  短暂一两次通常是上游抖动或当时本机流量占满；频繁出现才需要考虑换线路或找服务商"
+  fi
+  dim "  说明：采样是「实际用量」不是「能力测试」。用量低不等于被限速，"
+  dim "        只有「有多个连接、却始终跑不过上限 20%」才值得怀疑。"
+  dim "        历史测速记录才是直接证据，偏低的那几条已经标出来了。"
+}
+
 menu_log() {
   local act n
   say ""
@@ -1049,6 +1160,7 @@ draw_menu() {
   say "  8) IPv6 与多 IP 用户说明（进阶）"
   say "  9) 高级参数（cake 选项 / 上下行分别限速）"
   say " 10) 采样日志与现场诊断"
+  say " 11) 带宽健康报告（是否被限速，可给小白看）"
   say "  0) 退出"
   hr
 }
@@ -1070,6 +1182,7 @@ main_menu() {
       8) menu_advice ;;
       9) menu_advanced ;;
       10) menu_log ;;
+      11) health_report; pause ;;
       0|q|Q) say ""; exit 0 ;;
       *) note "无效输入"; sleep 1 ;;
     esac
@@ -1088,6 +1201,7 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare log            采样一次（供 systemd timer 调用）
   cake-fairshare report [N]     查看最近 N 条采样
   cake-fairshare check          现场诊断（判断是否自身占满）
+  cake-fairshare health         带宽健康报告（限速历史）
   cake-fairshare init [带宽] [--clean]
                                 一键配置并启用；--clean 自动停用冲突的限速服务
   cake-fairshare preflight      只检查环境，不改任何东西
@@ -1109,6 +1223,7 @@ case "${1:-}" in
   sample)         require_root; sample_once ;;
   report)         require_root; show_report "${2:-30}" ;;
   check)          require_root; load_conf; diagnose "${2:-}" ;;
+  health)         require_root; health_report ;;
   preflight)      require_root; preflight ;;
   init)
     shift
