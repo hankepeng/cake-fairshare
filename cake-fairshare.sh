@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -682,8 +682,15 @@ EOF
 }
 
 do_init() {
-  local rate ifc
-  rate=$(normalize_rate "${1:-$DEF_RATE}") || die "带宽格式无法识别：${1:-}"
+  local rate="" ifc a clean=0
+  for a in "$@"; do
+    case "$a" in
+      --clean) clean=1 ;;
+      "" ) ;;
+      *) rate="$a" ;;
+    esac
+  done
+  rate=$(normalize_rate "${rate:-$DEF_RATE}") || die "带宽格式无法识别：${rate:-}"
   ifc=$(primary_iface)
   [ -n "$ifc" ] || die "找不到默认路由网卡，请手动用菜单第 2 项配置"
   require_root
@@ -699,7 +706,11 @@ do_init() {
   ok "配置：网卡 $IFACES  带宽 $RATE  方向 both  入口参数 ${CAKE_OPTS_INGRESS:-无}"
 
   say ""
-  preflight || note "上面这些冲突项未自动处理，需要的话运行菜单第 2 项"
+  if [ "$clean" = "1" ]; then
+    cleanup_conflicts
+  else
+    preflight || note "上面这些冲突项未自动处理；需要自动停用请加 --clean"
+  fi
 
   say ""
   do_apply || die "启用失败，见上方提示"
@@ -1077,7 +1088,8 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare log            采样一次（供 systemd timer 调用）
   cake-fairshare report [N]     查看最近 N 条采样
   cake-fairshare check          现场诊断（判断是否自身占满）
-  cake-fairshare init [带宽]    用默认参数一键配置并启用（新机器用这个）
+  cake-fairshare init [带宽] [--clean]
+                                一键配置并启用；--clean 自动停用冲突的限速服务
   cake-fairshare preflight      只检查环境，不改任何东西
   cake-fairshare --help
 
@@ -1098,7 +1110,12 @@ case "${1:-}" in
   report)         require_root; show_report "${2:-30}" ;;
   check)          require_root; load_conf; diagnose "${2:-}" ;;
   preflight)      require_root; preflight ;;
-  init)           load_conf; do_init "${2:-}" ;;
+  init)
+    shift
+    load_conf
+    require_root
+    do_init "$@"
+    ;;
   -h|--help|help) usage ;;
   *)              usage; exit 1 ;;
 esac

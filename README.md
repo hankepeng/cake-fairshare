@@ -56,13 +56,36 @@ tc qdisc replace dev ifb0 root cake bandwidth 95mbit dual-srchost
 
 ## 快速开始
 
+**一条命令**（安装 → 配置 → 启用 → 开机自启，全程无交互）：
+
 ```bash
-# 一键安装 + 一键配置（推荐）
 bash <(curl -fsSL https://raw.githubusercontent.com/hankepeng/cake-fairshare/main/install.sh)
-sudo cake-fairshare init
 ```
 
-`init` 会做四件事：按默认参数生成配置、跑一次环境预检、立即启用整形、设置开机自启。全程无交互。
+带参数时：
+
+```bash
+# 顺带停用机器上其它限速服务（批量部署时最省事）
+bash <(curl -fsSL https://raw.githubusercontent.com/hankepeng/cake-fairshare/main/install.sh) --clean
+
+# 指定带宽
+bash <(curl -fsSL https://raw.githubusercontent.com/hankepeng/cake-fairshare/main/install.sh) 95mbit
+
+# 只安装，不动配置
+bash <(curl -fsSL https://raw.githubusercontent.com/hankepeng/cake-fairshare/main/install.sh) --no-init
+```
+
+已有配置的机器重复执行安装脚本时**不会覆盖配置**，只做 apply，可以放心当作升级命令用。
+
+等价的拆开写法（已装好脚本时）：
+
+```bash
+sudo cake-fairshare init            # 默认参数
+sudo cake-fairshare init --clean    # 默认参数 + 停用冲突服务
+sudo cake-fairshare init 95mbit     # 指定带宽
+```
+
+`init` 会做四件事：按默认参数生成配置、跑一次环境预检、立即启用整形、设置开机自启。
 
 默认参数就是**为境外代理节点准备的**：
 
@@ -106,7 +129,7 @@ sudo cake-fairshare init
 ## 交互菜单
 
 ```
-  CAKE 公平带宽分配 v2.4.0   Debian GNU/Linux 12 (bookworm)
+  CAKE 公平带宽分配 v2.5.0   Debian GNU/Linux 12 (bookworm)
 ------------------------------------------------------------
   状态：○ 未启用      网卡 eth0   带宽 95mbit   方向 both
 ------------------------------------------------------------
@@ -139,7 +162,7 @@ cake-fairshare log              # 采样一次（供 timer 调用）
 cake-fairshare report [N]       # 查看最近 N 条采样
 cake-fairshare check            # 现场诊断：判断是自身占满还是链路问题
 cake-fairshare preflight        # 只检查环境冲突，不做任何改动
-cake-fairshare init [带宽]      # 用默认参数一键配置 + 启用 + 开机自启
+cake-fairshare init [带宽] [--clean]   # 一键配置 + 启用 + 开机自启
 ```
 
 ## 环境预检与自动清理

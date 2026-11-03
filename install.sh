@@ -2,8 +2,15 @@
 # =============================================================================
 # cake-fairshare 安装脚本
 #
-#   bash install.sh                    # 使用同目录下的 cake-fairshare.sh
-#   bash <(curl -fsSL .../install.sh)  # 在线安装
+#   bash install.sh                 安装 + 自动配置启用（默认 190mbit）
+#   bash install.sh 95mbit          安装 + 指定带宽
+#   bash install.sh --clean         安装 + 自动停用冲突的限速服务
+#   bash install.sh 95mbit --clean  两者组合
+#   bash install.sh --no-init       只安装，不改动配置
+#
+#   在线一行搞定：
+#   bash <(curl -fsSL https://raw.githubusercontent.com/hankepeng/cake-fairshare/main/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/hankepeng/cake-fairshare/main/install.sh) --clean
 #
 # 安装位置：/usr/local/sbin/cake-fairshare
 # =============================================================================
@@ -13,7 +20,25 @@ set -euo pipefail
 REPO="hankepeng/cake-fairshare"
 BRANCH="main"
 TARGET="/usr/local/sbin/cake-fairshare"
+CONF="/etc/cake-fairshare/config"
 URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/cake-fairshare.sh"
+
+RATE=""
+CLEAN=0
+DO_INIT=1
+
+for a in "$@"; do
+  case "$a" in
+    --clean)   CLEAN=1 ;;
+    --no-init) DO_INIT=0 ;;
+    -h|--help)
+      sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    "") ;;
+    *) RATE="$a" ;;
+  esac
+done
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "请用 root 运行： sudo bash $0" >&2
@@ -44,11 +69,34 @@ fi
 
 install -m 0755 "$tmp" "$TARGET"
 echo ">> 已安装到 ${TARGET}"
+
+if [ "$DO_INIT" -eq 0 ]; then
+  echo
+  echo "已跳过配置。需要时执行： sudo cake-fairshare init"
+  exit 0
+fi
+
+# 已有配置且没显式给参数时，不覆盖
+if [ -f "$CONF" ] && [ -z "$RATE" ] && [ "$CLEAN" -eq 0 ]; then
+  echo
+  echo ">> 检测到已有配置 ${CONF}，跳过初始化（要重配： sudo cake-fairshare init）"
+  "$TARGET" apply || true
+  exit 0
+fi
+
 echo
-echo "下一步（二选一）："
-echo "  sudo cake-fairshare init        # 一键：默认参数 + 开机自启"
-echo "  sudo cake-fairshare             # 交互菜单：1 自检 → 2 启用 → 6 自启"
+set -- init
+if [ -n "$RATE" ]; then set -- "$@" "$RATE"; fi
+if [ "$CLEAN" -eq 1 ]; then set -- "$@" --clean; fi
+
+if ! "$TARGET" "$@"; then
+  echo
+  echo "!! 配置失败，可运行 sudo cake-fairshare 用交互菜单排查" >&2
+  exit 1
+fi
+
 echo
-echo "默认带宽 ${DEF_HINT:-190mbit}（对应 200M 峰值套餐），其他套餐用："
-echo "  sudo cake-fairshare init 95mbit    # 100M 套餐"
-echo "  sudo cake-fairshare init 28mbit    # 30M 套餐"
+echo "== 完成 =="
+echo "  查看状态： sudo cake-fairshare status"
+echo "  现场诊断： sudo cake-fairshare check"
+echo "  交互菜单： sudo cake-fairshare"
