@@ -1,0 +1,169 @@
+# cake-fairshare
+
+> 一台 100M 的节点，1 人在线就给他 100M，5 人在线各 20M，10 人在线各 10M —— 自动跟随在线人数变化，不需要在面板里给任何人写死速度。
+
+<p>
+  <img alt="platform" src="https://img.shields.io/badge/platform-Debian%2012%20%7C%20Ubuntu%2022.04%2B-brightgreen">
+  <img alt="kernel" src="https://img.shields.io/badge/kernel-4.19%2B-blue">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-black">
+</p>
+
+基于 Linux 内核 CAKE 队列的 per-host 公平调度，把整机带宽按**当前在线客户端**平均分配。入口/出口双向整形，单人开几十条连接也抢不走别人那一份。
+
+---
+
+## 它解决什么问题
+
+XrayR 这类后端在面板未设限时**不做任何带宽分配**，`SpeedLimit=0` 的连接上不挂限速器，数据包直接交给内核。此时谁抢到多少，取决于三件与"人"无关的事：
+
+1. 内核 qdisc（Debian 内核默认 `pfifo_fast`，很多镜像改成 `fq_codel`/`fq`）
+2. 每个客户端开了多少条 TCP 流
+3. 各端的拥塞控制算法
+
+结果是 **按流竞争，不是按人分配**。一台 100M 节点上 5 个人在线，实测常见分布是 `52 / 21 / 13 / 8 / 6`（开 16 线程下载的人拿一半），而不是每人 20。
+
+在面板里给每个用户写死速度能解决"防抢占"，但解决不了"人少时浪费、人多时不够"——那需要一个会自己算的分配器。这就是本项目做的事。
+
+## 效果对比
+
+以 100M 节点、95mbit 整形为例：
+
+| 在线人数 | 未整形（按流竞争） | cake-fairshare |
+|:---:|---|---|
+| 1 | 单流可跑满 100M | 95M 全给 |
+| 2 | 各自单流约 50M；一方多线程则可能 80 : 20 | 各 ≈ 47M |
+| 5 | 均值 20M，实测 6 ~ 52M，随谁在下载而变 | 各 ≈ 19M |
+| 10 | 均值 10M，队列堆积，延迟从 20ms 涨到 200ms+ | 各 ≈ 9.5M，延迟基本不变 |
+
+份额是**上限而非固定值**：3 人在线时每个人都能 burst 到 30M，空闲带宽不会被浪费。
+
+## 原理
+
+只有两件事，都作用在网卡上，与面板和账号体系无关：
+
+```bash
+# 出口：服务器 -> 客户端，按「目的 IP」公平（每个客户端一份）
+tc qdisc replace dev eth0 root cake bandwidth 95mbit dual-dsthost
+
+# 入口：客户端 -> 服务器，按「源 IP」公平（经 ifb 中转）
+tc qdisc replace dev eth0 handle ffff: ingress
+tc filter  add    dev eth0 parent ffff: protocol all u32 \
+          match u32 0 0 action mirred egress redirect dev ifb0
+tc qdisc replace dev ifb0 root cake bandwidth 95mbit dual-srchost
+```
+
+`final` 效果 = CAKE 的 deficit 整形器 + host 隔离：同一 IP 无论开多少流，总量不超过自己那一份；没人用满时自动释放给其他人。
+
+## 快速开始
+
+```bash
+# 方式一：一键安装（需 root）
+bash <(curl -fsSL https://raw.githubusercontent.com/hankepeng/cake-fairshare/main/install.sh)
+sudo cake-fairshare
+
+# 方式二：手动
+git clone https://github.com/hankepeng/cake-fairshare.git
+cd cake-fairshare
+sudo install -m 0755 cake-fairshare.sh /usr/local/sbin/cake-fairshare
+sudo cake-fairshare
+```
+
+进入菜单 → 选 `1` 自检 → 选 `2` 启用（带宽填实测值的 **95%** 左右）→ 选 `6` 开启开机自启。
+
+## 交互菜单
+
+```
+  CAKE 公平带宽分配 v2.0.0   Debian GNU/Linux 12 (bookworm)
+------------------------------------------------------------
+  状态：○ 未启用      网卡 eth0   带宽 95mbit   方向 both
+------------------------------------------------------------
+  1) 环境自检（系统 / 内核 / 网卡 / qdisc / BBR / cake 支持）
+  2) 启用或重新配置整形
+  3) 查看当前状态快照
+  4) 实时流量监控
+  5) 停止整形并恢复原始 qdisc
+  6) 开机自启（安装 / 移除 / 查看）
+  7) 调整带宽
+  8) IPv6 与多 IP 用户说明（进阶）
+  0) 退出
+```
+
+- **启用前会打印将要执行的 tc 命令**，确认后才落地；执行失败会清理状态记录，不留半成品。
+- 第 `4` 项每 2 秒刷新一次整机上下行实速与 qdisc 的 `backlog`/`overlimits`，压没压得住一眼看得出。
+
+## 命令行
+
+```bash
+cake-fairshare                  # 交互菜单
+cake-fairshare apply            # 按配置启用（无交互，systemd 使用）
+cake-fairshare stop             # 撤销整形，恢复启用前的 qdisc
+cake-fairshare status           # 快照
+cake-fairshare monitor [网卡]   # 实时监控
+```
+
+## 文件位置
+
+| 路径 | 用途 |
+|---|---|
+| `/usr/local/sbin/cake-fairshare` | 程序本体 |
+| `/etc/cake-fairshare/config` | 网卡 / 带宽 / 方向 |
+| `/etc/cake-fairshare/state.<网卡>` | 启用前的 qdisc 与 ifb 名，用于精确回滚 |
+| `/etc/systemd/system/cake-fairshare.service` | 开机自启单元（菜单第 6 项生成） |
+| `/var/log/cake-fairshare.log` | apply / stop / 失败原因 |
+
+## 回滚
+
+```bash
+sudo cake-fairshare     # 第 6 项 → 2 移除自启；第 5 项 → 停止整形
+rm -rf /etc/cake-fairshare
+```
+
+`stop` 不是简单粗暴地删根队列，而是按 state 文件把你**启用前的那个 qdisc 挂回去**——原本跑 `fq` 的机器会精确回到 `fq`。
+
+## 常见问题
+
+**带宽应该填多少？** 实测值的 95% 左右。填满甚至超过实际链路时，队列不成为瓶颈，整形形同虚设。
+
+**已经开了 BBR + fq，会冲突吗？** 不会。BBR 决定发多快，CAKE 决定怎么排队，两者不同层。内核 4.13 起 BBR 可自行 pacing，把 root qdisc 从 `fq` 换成 `cake` 不影响 BBR 工作。建议保留 `net.core.default_qdisc=fq` 作为兜底（tc 规则没生效时会回落，比 `pfifo_fast` 好）。
+
+**同时有 IPv4 和 IPv6 呢？** tc 工作在 IP 层之下，v4/v6 共用同一个 qdisc，一定生效。但公平单位是 IP 而不是账号：一个用户双栈同时连接会被算成两个 host，拿两份份额。菜单第 8 项给了按前缀归并的方案。
+
+**报 `mq` 相关错误？** 网卡是多发送队列（virtio 常见），`cake` 不能直接挂 root。脚本会自动尝试 `cake_mq`；不支持时执行 `ethtool -L eth0 combined 1`（先 `ethtool -l eth0` 记下原值以便回滚）。
+
+**和面板限速是什么关系？** 不冲突，串联后取较小值：`实际速度 = min(套餐档位, 总带宽 / 在线人数)`。CAKE 负责兜底公平，面板限速负责区分套餐。
+
+**真的生效了吗？**
+
+```bash
+tc -s qdisc show dev eth0     # 应出现 cake ... bandwidth 95Mbit dual-dsthost
+tc -s qdisc show dev ifb0
+# overlimits / drops 持续增长 = 正在压制；backlog 长期堆满 = 带宽设高了
+```
+
+## 兼容性
+
+| 系统 | 说明 |
+|---|---|
+| Debian 12 / Ubuntu 22.04+ | 内核自带 `sch_cake`，开箱可用 |
+| Debian 11 / Ubuntu 20.04 | 内核 ≥ 4.19 同样支持（CAKE 自 4.19 进入上游） |
+| RHEL / Rocky / Alma 9 | 需 `dnf install iproute iproute-tc`，`sch_cake` 在 `kernel-modules` 中 |
+| 高于 2 Gbps | 单队列 CAKE 受 qdisc 锁限制，建议改用 `fq_codel` + 应用层限速，或等待 `cake_mq` |
+
+## License
+
+[MIT](LICENSE)
+
+---
+
+<details>
+<summary>English</summary>
+
+**cake-fairshare** shares a node's total bandwidth equally among currently online clients, using Linux `tc` CAKE queueing with per-host isolation — no panel-side per-user speed limits required. On a 100 Mbit node: 1 client gets ~100 Mbit, 5 clients get ~20 Mbit each, and a single client with 50 concurrent flows still cannot take more than its share.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/hankepeng/cake-fairshare/main/install.sh)
+sudo cake-fairshare
+```
+
+Requires Linux ≥ 4.19 with `sch_cake` (Debian 12 / Ubuntu 22.04+ ship it). MIT licensed.
+</details>
