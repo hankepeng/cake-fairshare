@@ -73,7 +73,7 @@ sudo cake-fairshare
 ## 交互菜单
 
 ```
-  CAKE 公平带宽分配 v2.0.1   Debian GNU/Linux 12 (bookworm)
+  CAKE 公平带宽分配 v2.1.0   Debian GNU/Linux 12 (bookworm)
 ------------------------------------------------------------
   状态：○ 未启用      网卡 eth0   带宽 95mbit   方向 both
 ------------------------------------------------------------
@@ -85,11 +85,13 @@ sudo cake-fairshare
   6) 开机自启（安装 / 移除 / 查看）
   7) 调整带宽
   8) IPv6 与多 IP 用户说明（进阶）
+  9) 高级参数（cake 选项 / 上下行分别限速）
   0) 退出
 ```
 
 - **启用前会打印将要执行的 tc 命令**，确认后才落地；执行失败会清理状态记录，不留半成品。
 - 第 `4` 项每 2 秒刷新一次整机上下行实速与 qdisc 的 `backlog`/`overlimits`，压没压得住一眼看得出。
+- 第 `9` 项可追加 cake 原生参数，最常用的是 `ack-filter`：跨国链路的上行有大量纯 ACK 小包，压掉它们等于免费抬高有效吞吐，且**不改变限速值**。
 
 ## 命令行
 
@@ -106,10 +108,26 @@ cake-fairshare monitor [网卡]   # 实时监控
 | 路径 | 用途 |
 |---|---|
 | `/usr/local/sbin/cake-fairshare` | 程序本体 |
-| `/etc/cake-fairshare/config` | 网卡 / 带宽 / 方向 |
+| `/etc/cake-fairshare/config` | 网卡 / 带宽 / 方向 / 高级参数 |
 | `/etc/cake-fairshare/state.<网卡>` | 启用前的 qdisc 与 ifb 名，用于精确回滚 |
 | `/etc/systemd/system/cake-fairshare.service` | 开机自启单元（菜单第 6 项生成） |
 | `/var/log/cake-fairshare.log` | apply / stop / 失败原因 |
+
+配置文件各字段：
+
+```bash
+IFACES="eth0"              # 网卡，多块用空格分隔
+RATE="160mbit"             # 基准带宽，上下行都用它
+MODE="both"                # both = 双向整形；down = 只整形出口
+RATE_EGRESS=""             # 留空跟随 RATE；填写则单独覆盖出口
+RATE_INGRESS=""            # 留空跟随 RATE；填写则单独覆盖入口
+CAKE_OPTS=""               # 追加到两个方向的 cake 参数，如 "rtt 70ms overhead 38"
+CAKE_OPTS_INGRESS=""       # 只追加到入口，如 "ack-filter"
+```
+
+改完执行 `sudo cake-fairshare apply` 生效，或直接用菜单第 9 项改。
+
+**关于 `ack-filter`**：它只压缩 TCP 的纯 ACK 包，不改变整形带宽，适合客户端与节点之间有较大 RTT 的场景（例如国内连境外节点）。上行方向收益最明显，所以一般放在 `CAKE_OPTS_INGRESS`。若链路上有异常或需要排查丢包，先把它去掉再测。
 
 ## 回滚
 

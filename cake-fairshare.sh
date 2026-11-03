@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.0.1"
+VERSION="2.1.0"
 CONF_DIR="/etc/cake-fairshare"
 CONF="${CONF_DIR}/config"
 UNIT="/etc/systemd/system/cake-fairshare.service"
@@ -111,6 +111,7 @@ normalize_rate() {
 # ------------------------------------------------------------ 配置与状态 ----
 load_conf() {
   IFACES=""; RATE="95mbit"; MODE="both"
+  RATE_EGRESS=""; RATE_INGRESS=""; CAKE_OPTS=""; CAKE_OPTS_INGRESS=""
   # shellcheck disable=SC1090
   if [ -r "$CONF" ]; then . "$CONF"; fi
 }
@@ -122,6 +123,11 @@ save_conf() {
     printf 'IFACES="%s"\n' "$IFACES"
     printf 'RATE="%s"\n' "$RATE"
     printf 'MODE="%s"\n' "$MODE"
+    printf '# 下面四项留空表示不启用；菜单第 9 项可直接改\n'
+    printf 'RATE_EGRESS="%s"\n' "$RATE_EGRESS"
+    printf 'RATE_INGRESS="%s"\n' "$RATE_INGRESS"
+    printf 'CAKE_OPTS="%s"\n' "$CAKE_OPTS"
+    printf 'CAKE_OPTS_INGRESS="%s"\n' "$CAKE_OPTS_INGRESS"
   } >"$CONF"
 }
 
@@ -155,6 +161,9 @@ is_active() {
 apply_one() {
   local ifc="$1" rate="$2" mode="$3"
   local qdisc="cake" orig cur prev_orig prev_ifb ifb="" idx=0
+  local r_eg r_in
+  r_eg="${RATE_EGRESS:-$rate}"
+  r_in="${RATE_INGRESS:-$rate}"
 
   cur=$(root_qdisc "$ifc")
   if [ "$cur" = "mq" ]; then
@@ -199,13 +208,14 @@ apply_one() {
   clear_state "$ifc"
   put_state "$ifc" ORIG_QDISC "$orig"
 
-  if ! tc qdisc replace dev "$ifc" root "$qdisc" bandwidth "$rate" dual-dsthost 2>/dev/null; then
-    bad "在 $ifc 上挂 $qdisc 失败"
-    logline "FAIL $ifc tc-replace"
+  # shellcheck disable=SC2086
+  if ! tc qdisc replace dev "$ifc" root "$qdisc" bandwidth "$r_eg" dual-dsthost ${CAKE_OPTS:-} 2>/dev/null; then
+    bad "在 $ifc 上挂 $qdisc 失败（检查 CAKE_OPTS 是否合法）"
+    logline "FAIL $ifc tc-replace opts=[${CAKE_OPTS:-}]"
     clear_state "$ifc"
     return 1
   fi
-  ok "出口整形：$ifc  $qdisc bandwidth $rate dual-dsthost"
+  ok "出口整形：$ifc  $qdisc bandwidth $r_eg dual-dsthost ${CAKE_OPTS:-}"
 
   if [ "$mode" = "both" ]; then
     while ip link show "ifb$idx" >/dev/null 2>&1; do idx=$((idx + 1)); done
@@ -215,9 +225,10 @@ apply_one() {
       tc qdisc add dev "$ifc" handle ffff: ingress 2>/dev/null
       tc filter add dev "$ifc" parent ffff: protocol all u32 \
           match u32 0 0 action mirred egress redirect dev "$ifb" >/dev/null 2>&1
-      tc qdisc replace dev "$ifb" root cake bandwidth "$rate" dual-srchost 2>/dev/null
+      # shellcheck disable=SC2086
+      tc qdisc replace dev "$ifb" root cake bandwidth "$r_in" dual-srchost ${CAKE_OPTS:-} ${CAKE_OPTS_INGRESS:-} 2>/dev/null
       put_state "$ifc" IFB "$ifb"
-      ok "入口整形：$ifc -> $ifb  cake bandwidth $rate dual-srchost"
+      ok "入口整形：$ifc -> $ifb  cake bandwidth $r_in dual-srchost ${CAKE_OPTS:-} ${CAKE_OPTS_INGRESS:-}"
     else
       note "入口整形建立失败（ifb 模块缺失？），仅生效出口方向"
     fi
@@ -450,6 +461,9 @@ menu_rate() {
   if [ -z "$IFACES" ]; then note "尚未配置，请先执行第 2 项"; pause; return 1; fi
   say ""
   say "当前带宽：${B}$RATE${R}    网卡：$IFACES"
+  if [ -n "${RATE_EGRESS:-}" ] || [ -n "${RATE_INGRESS:-}" ]; then
+    note "已在第 9 项设置了单独的上/下行带宽，本次只改基准值，不覆盖它们"
+  fi
   read -rp "新带宽（如 180mbit）: " rate
   if [ -z "$rate" ]; then note "已取消"; pause; return 0; fi
   rate=$(normalize_rate "$rate") || { bad "带宽格式无法识别"; pause; return 1; }
@@ -574,6 +588,57 @@ menu_advice() {
   pause
 }
 
+menu_advanced() {
+  local e i o oi ifc
+  load_conf
+  if [ -z "$IFACES" ]; then note "尚未配置，请先执行第 2 项"; pause; return 1; fi
+  say ""
+  say "${B}高级参数${R}"
+  hr
+  say "  留空 = 保持不变，输入 - = 清空。参数会原样追加到 cake 命令行。"
+  say "  常用： ack-filter（压缩上行纯 ACK）  rtt 70ms  overhead 38  nat  wash"
+  say "  注意：上下行分别限速后，第 7 项改的是基准值，此处会覆盖它。"
+  hr
+  printf '  出口带宽（当前 %s）: ' "${RATE_EGRESS:-跟随 $RATE}"
+  read -rp "" e
+  printf '  入口带宽（当前 %s）: ' "${RATE_INGRESS:-跟随 $RATE}"
+  read -rp "" i
+  printf '  通用 cake 参数（当前 %s）: ' "${CAKE_OPTS:-无}"
+  read -rp "" o
+  printf '  仅入口 cake 参数（当前 %s）: ' "${CAKE_OPTS_INGRESS:-无}"
+  read -rp "" oi
+
+  if [ -n "$e" ]; then
+    if [ "$e" = "-" ]; then RATE_EGRESS=""; else
+      RATE_EGRESS=$(normalize_rate "$e") || { bad "出口带宽格式无法识别"; pause; return 1; }
+    fi
+  fi
+  if [ -n "$i" ]; then
+    if [ "$i" = "-" ]; then RATE_INGRESS=""; else
+      RATE_INGRESS=$(normalize_rate "$i") || { bad "入口带宽格式无法识别"; pause; return 1; }
+    fi
+  fi
+  if [ "$o" = "-" ]; then CAKE_OPTS=""; elif [ -n "$o" ]; then CAKE_OPTS="$o"; fi
+  if [ "$oi" = "-" ]; then CAKE_OPTS_INGRESS=""; elif [ -n "$oi" ]; then CAKE_OPTS_INGRESS="$oi"; fi
+
+  save_conf
+  say ""
+  dim "  出口：bandwidth ${RATE_EGRESS:-$RATE} dual-dsthost ${CAKE_OPTS:-}"
+  dim "  入口：bandwidth ${RATE_INGRESS:-$RATE} dual-srchost ${CAKE_OPTS:-} ${CAKE_OPTS_INGRESS:-}"
+  say ""
+  local rc=0
+  for ifc in $IFACES; do
+    apply_one "$ifc" "$RATE" "$MODE" || rc=1
+  done
+  if [ "$rc" -eq 0 ]; then
+    ok "已应用"
+  else
+    note "有网卡应用失败（参数可能非法），该网卡原有规则未被替换"
+  fi
+  dim "  验证： tc qdisc show dev <网卡>"
+  pause
+}
+
 # ---------------------------------------------------------------- 主菜单 ----
 draw_menu() {
   clear
@@ -599,6 +664,7 @@ draw_menu() {
   say "  6) 开机自启（安装 / 移除 / 查看）"
   say "  7) 调整带宽"
   say "  8) IPv6 与多 IP 用户说明（进阶）"
+  say "  9) 高级参数（cake 选项 / 上下行分别限速）"
   say "  0) 退出"
   hr
 }
@@ -618,6 +684,7 @@ main_menu() {
       6) menu_service ;;
       7) menu_rate ;;
       8) menu_advice ;;
+      9) menu_advanced ;;
       0|q|Q) say ""; exit 0 ;;
       *) note "无效输入"; sleep 1 ;;
     esac
