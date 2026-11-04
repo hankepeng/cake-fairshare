@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.5"
+VERSION="3.6.6"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -2326,17 +2326,20 @@ sample_peaks() {
 recommend_rate() {
   # 计算推荐带宽 → REC_EG / REC_IN / REC_WHY / REC_SUGGEST / REC_HINT
   #
+  # 方向约定（实测校准过）：
+  #   speedtest 的 Upload   = 服务器出口 = 用户下载 → 决定 RATE_EGRESS
+  #   speedtest 的 Download = 服务器入口 = 用户上传 → 决定 RATE_INGRESS
+  # 非对称链路上这两个值可能差好几倍，不能拿 Download 当出口。
+  #
   # 安全原则（血泪教训）：**机器已经在限速时，绝不自动改这个数字**。
-  # 因为测速历史里可能包含"临时关掉整形"测出来的值（实测见过 190M 的机器测出 415M），
-  # 拿它 ×95% 会推荐到远超套餐的数值，一键点下去就可能被平台限速。
   # 只有从未限过速的机器（新装），才用测速峰值当作起点。
-  local cur_eg cur_in pu pd _n has_conf=0 d_eg d_in
+  local cur_eg cur_in pi pe _n has_conf=0 d_eg d_in
   # 注意：load_conf 会把 RATE 默认成 DEF_RATE，所以不能只看 RATE 是否有值，
   # 必须看配置文件到底存不存在，否则新机器永远走不到"按测速取值"这一支。
   [ -r "$CONF" ] && has_conf=1
   cur_eg=$(unit_num "${RATE_EGRESS:-$RATE}")
   cur_in=$(unit_num "${RATE_INGRESS:-$RATE}")
-  read -r pu pd _n <<<"$(speedtest_peaks)"
+  read -r pi pe _n <<<"$(speedtest_peaks)"
 
   REC_EG=0; REC_IN=0; REC_WHY=""; REC_SUGGEST=0; REC_HINT=""
 
@@ -2344,13 +2347,16 @@ recommend_rate() {
     REC_EG=$cur_eg
     REC_IN=${cur_in:-$cur_eg}
     REC_WHY="沿用当前出口 ${cur_eg} / 入口 ${REC_IN} Mbps（已在限速，不自动改动这个数字）"
-    if awk -v p="$pu" -v c="$cur_eg" 'BEGIN{exit !(p > c * 2)}'; then
-      REC_HINT="测速历史里出方向到过 ${pu} Mbps，是当前上限的 $(awk -v p="$pu" -v c="$cur_eg" 'BEGIN{printf "%d", p / c}') 倍多——那次多半是关掉整形测的，不能当稳态能力"
-    elif awk -v p="$pu" -v c="$cur_eg" 'BEGIN{exit !(p > c * 1.02)}'; then
-      REC_SUGGEST=$(awk -v p="$pu" 'BEGIN{printf "%d", p * 0.95}')
-      REC_HINT="测速历史里出方向到过 ${pu} Mbps，比当前上限 ${cur_eg} 高；若套餐带宽确实更大，可上调到 ${REC_SUGGEST} Mbps"
+    if awk -v p="$pe" -v c="$cur_eg" 'BEGIN{exit !(p > c * 2)}'; then
+      REC_HINT="测速历史里出口（服务器上行）到过 ${pe} Mbps，是当前上限的 $(awk -v p="$pe" -v c="$cur_eg" 'BEGIN{printf "%d", p / c}') 倍多——那次多半是关掉整形测的，不能当稳态能力"
+    elif awk -v p="$pe" -v c="$cur_eg" 'BEGIN{exit !(p > c * 1.02)}'; then
+      REC_SUGGEST=$(awk -v p="$pe" 'BEGIN{printf "%d", p * 0.95}')
+      REC_HINT="测速历史里出口到过 ${pe} Mbps，比当前上限 ${cur_eg} 高；若套餐带宽确实更大，可上调出口到 ${REC_SUGGEST} Mbps"
     else
       REC_HINT=""
+    fi
+    if awk -v p="$pi" -v c="$REC_IN" 'BEGIN{exit !(p > c * 1.02 && p <= c * 2)}'; then
+      REC_HINT="${REC_HINT:+${REC_HINT}；}入口（服务器下行）测速峰值 ${pi} Mbps，高于当前上限 ${REC_IN}，可考虑单独上调入口"
     fi
   else
     # 新机器：机器上可能还留着别的限速脚本，先沿用它的速率，其次才看测速
@@ -2360,10 +2366,18 @@ recommend_rate() {
       REC_IN=$(unit_num "${d_in:-$d_eg}")
       [ "$REC_IN" -gt 0 ] 2>/dev/null || REC_IN=$REC_EG
       REC_WHY="机器上已有整形脚本，沿用它的速率：出口 ${REC_EG} / 入口 ${REC_IN} Mbps"
-    elif awk -v p="$pu" 'BEGIN{exit !(p > 0)}'; then
-      REC_EG=$(awk -v p="$pu" 'BEGIN{printf "%d", p * 0.95}')
+    elif awk -v p="$pe" 'BEGIN{exit !(p > 0)}'; then
+      REC_EG=$(awk -v p="$pe" 'BEGIN{printf "%d", p * 0.95}')
+      if awk -v p="$pi" 'BEGIN{exit !(p > 0)}'; then
+        REC_IN=$(awk -v p="$pi" 'BEGIN{printf "%d", p * 0.95}')
+      else
+        REC_IN=$REC_EG
+      fi
+      REC_WHY="没有历史整形，按测速峰值：出口 上行 ${pe} Mbps → ${REC_EG}，入口 下行 ${pi:-同出口} Mbps → ${REC_IN}（均取 95%）"
+    elif awk -v p="$pi" 'BEGIN{exit !(p > 0)}'; then
+      REC_EG=$(awk -v p="$pi" 'BEGIN{printf "%d", p * 0.95}')
       REC_IN=$REC_EG
-      REC_WHY="没有历史整形，按测速历史出方向峰值 ${pu} Mbps 的 95% 取"
+      REC_WHY="没有出口测速记录，暂按下行峰值 ${pi} Mbps 的 95% 取"
     else
       REC_EG=$(unit_num "$DEF_RATE")
       REC_IN=$REC_EG
@@ -2444,9 +2458,9 @@ do_optimize() {
     printf '  提示      %s\n' "$REC_HINT"
   fi
   if [ "${REC_SUGGEST:-0}" -gt 0 ] 2>/dev/null; then
-    read -rp "  是否同时把带宽上调到 ${REC_SUGGEST} Mbps ？（默认不动）[y/N]: " ans
+    read -rp "  是否把出口上调到 ${REC_SUGGEST} Mbps？（入口保持不变）[y/N]: " ans
     case "${ans:-N}" in
-      y | Y) REC_EG=$REC_SUGGEST; REC_IN=$REC_SUGGEST ;;
+      y | Y) REC_EG=$REC_SUGGEST ;;
     esac
   fi
 
