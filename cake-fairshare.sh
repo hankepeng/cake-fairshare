@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.0.1"
+VERSION="3.1.0"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -528,6 +528,153 @@ show_status() {
   done
   dim "  判读：backlog 长期 0 = 没到上限；backlog 持续堆积 / drops 增长 = 正在压制。"
   dim "        overlimits 只是被整形器调度过的包数，不等于超速次数，别当比例看。"
+}
+
+menu_monitor() {
+  local act
+  load_conf
+  say ""
+  say "${B}实时监控${R}"
+  hr
+  say "  1) 总体：整机上下行速率 + 队列计数"
+  say "  2) 按客户端：每个 IP 的实时上下行、连接数、估算份额    ← 新"
+  read -rp "选择 [默认 2]: " act
+  case "${act:-2}" in
+    1) monitor ;;
+    *) monitor_clients ;;
+  esac
+}
+
+client_snapshot() {
+  # 输出每行 "ip 下行字节 上行字节 连接数"
+  # 下行 = 服务器发给客户端（bytes_sent），上行 = 客户端发来（bytes_received）
+  # 只统计本地端口是本机监听端口的连接，排除 22，
+  # 否则会把 XrayR 出站到目标站的连接也算进来。
+  # 监听端口集合由调用方传入（一次采集里不会变），省掉每帧一次 ss 调用。
+  local lports="${1:-}"
+  [ -n "$lports" ] || lports=$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed -E 's/.*://' | grep -vx '22' | sort -u | tr '\n' ',')
+  [ -n "$lports" ] || return 0
+  ss -Htni state established 2>/dev/null | awk -v lp=",$lports" '
+    NF >= 4 && $3 ~ /:[0-9]+$/ && $4 ~ /:[0-9]+$/ {
+      n = split($3, a, ":")
+      if (index(lp, "," a[n] ",") > 0) {
+        ip = $4
+        sub(/:[0-9]+$/, "", ip)
+        gsub(/^\[/, "", ip); gsub(/\]$/, "", ip); sub(/^::ffff:/, "", ip)
+        cur = ip
+        C[ip]++
+      } else {
+        cur = ""
+      }
+      next
+    }
+    cur != "" && /bytes_sent:|bytes_received:/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^bytes_sent:/) { v = $i; sub(/^bytes_sent:/, "", v); S[cur] += v + 0 }
+        else if ($i ~ /^bytes_received:/) { v = $i; sub(/^bytes_received:/, "", v); R[cur] += v + 0 }
+      }
+    }
+    END { for (k in C) printf "%s %d %d %d\n", k, S[k], R[k], C[k] }
+  '
+}
+
+# 解析 tc -s qdisc show：按 dev 名分别取 backlog 字节数
+QD_AWK='
+  /^qdisc/ {
+    cur = ""; k = 0
+    for (i = 1; i <= NF; i++) if ($i == "dev") k = i + 1
+    if (k > 0) cur = $k
+  }
+  /backlog/ {
+    if (cur == a && ea == "") ea = $2
+    if (cur == b && eb == "") eb = $2
+  }
+  END {
+    sub(/b$/, "", ea); sub(/b$/, "", eb)
+    printf "%s %s\n", (ea == "" ? 0 : ea), (eb == "" ? 0 : eb)
+  }'
+
+monitor_clients() {
+  require_root
+  load_conf
+  local ifc interval="${1:-2}" cap_e cap_i f1 f2 t1 t2 stop=0 eb ib ifb lports
+  ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
+  [ -n "$ifc" ] || ifc=$(primary_iface)
+  [ -n "$ifc" ] || { note "没有可用网卡"; return 1; }
+  case "$interval" in '' | *[!0-9]*) interval=2 ;; esac
+  [ "$interval" -ge 1 ] || interval=1
+  cap_e=$(unit_num "${RATE_EGRESS:-$RATE}")
+  cap_i=$(unit_num "${RATE_INGRESS:-$RATE}")
+
+  f1=$(mktemp) || return 1
+  f2=$(mktemp) || { rm -f "$f1"; return 1; }
+  # 监听端口在一次观察期间不会变，算一次就够
+  local lports
+  lports=$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed -E 's/.*://' | grep -vx '22' | sort -u | tr '\n' ',')
+  [ -n "$lports" ] || { note "没找到正在监听的代理端口（XrayR 没跑？）"; rm -f "$f1" "$f2"; return 1; }
+  ifb=$(get_state "$ifc" IFB)
+  trap 'stop=1' INT
+  while [ "$stop" -eq 0 ]; do
+    # EPOCHREALTIME 是 bash 内建，比 date 少 fork 两次
+    if [ -n "${EPOCHREALTIME:-}" ]; then t1=${EPOCHREALTIME/./}; else t1=$(date +%s%6N); fi
+    client_snapshot "$lports" >"$f1"
+    sleep "$interval"
+    if [ -n "${EPOCHREALTIME:-}" ]; then t2=${EPOCHREALTIME/./}; else t2=$(date +%s%6N); fi
+    client_snapshot "$lports" >"$f2"
+    if [ -t 1 ]; then clear; fi
+    say "${B}客户端实时带宽${R}  ${D}$ifc   上限 下行 ${cap_e} / 上行 ${cap_i} Mbps   Ctrl-C 退出${R}"
+    hr
+    # 表头用 shell 手写而不是 awk 的 %-20s：printf 按字节补齐，
+    # 中文是 3 字节但只占 2 列宽，交给它排必然错位。
+    say "  客户端 IP            连接       下行       上行       合计  占份额"
+    say "  --------------------  ----  ---------  ---------  ---------  -------"
+    awk -v t="$t1" -v t2="$t2" -v ce="$cap_e" -v ci="$cap_i" '
+      BEGIN { dt = (t2 - t) / 1000000; if (dt <= 0) dt = 1 }
+      FNR == NR { s1[$1] = $2; r1[$1] = $3; next }
+      {
+        ip = $1
+        dn = ($2 - (ip in s1 ? s1[ip] : $2)) * 8 / dt / 1000000
+        up = ($3 - (ip in s1 ? r1[ip] : $3)) * 8 / dt / 1000000
+        if (dn < 0) dn = 0
+        if (up < 0) up = 0
+        n++
+        IP[n] = ip; DN[ip] = dn; UP[ip] = up; CN[ip] = $4
+        if (dn + up > 0.05) act++
+        TD += dn; TU += up
+      }
+      END {
+        for (i = 1; i <= n; i++) {
+          bi = i
+          for (j = i + 1; j <= n; j++)
+            if (DN[IP[j]] + UP[IP[j]] > DN[IP[bi]] + UP[IP[bi]]) bi = j
+          k = IP[i]; IP[i] = IP[bi]; IP[bi] = k
+        }
+        sh = (act > 0) ? ce / act : 0
+        shown = 0
+        for (i = 1; i <= n && shown < 12; i++) {
+          ip = IP[i]
+          if (DN[ip] + UP[ip] < 0.01) continue
+          pct = (sh > 0) ? (DN[ip] + UP[ip]) * 100 / sh : 0
+          printf "  %-20s %4d %10.2f %10.2f %10.2f %6.0f%%\n", ip, CN[ip], DN[ip], UP[ip], DN[ip] + UP[ip], pct
+          shown++
+        }
+        if (shown == 0) printf "  （当前没有在传输数据的客户端）\n"
+        printf "\n"
+        printf "  活跃客户端 %d 个（有流量的）   合计 下行 %.2f / 上行 %.2f Mbps\n", act, TD, TU
+        if (ce > 0 && act > 0)
+          printf "  每人估算份额 %.1f Mbps（%d ÷ %d）   出口占用 %.0f%%\n", sh, ce, act, TD * 100 / ce
+        if (n > act) printf "  另有 %d 个客户端连着但没有流量（不占份额）\n", n - act
+      }' "$f1" "$f2"
+    hr
+    # 一次 tc 同时取出口和入口的积压，别为两个数起两次进程。
+    # awk 脚本必须先放进单引号变量：直接内联进 "$(...)" 时，
+    # 里面的 $(i + 1) 和 $0 会被 bash 当成本机的命令替换／变量先展开掉。
+    read -r eb ib <<<"$(tc -s qdisc show 2>/dev/null | awk -v a="$ifc" -v b="$ifb" "$QD_AWK")"
+    dim "  出口队列积压 ${eb:-0} B   入口积压 ${ib:-0} B   （长期为 0 = 没到上限）"
+  done
+  trap - INT
+  rm -f "$f1" "$f2"
+  say ""
 }
 
 monitor() {
@@ -1746,7 +1893,7 @@ draw_menu() {
   say "  1) 环境自检（系统 / 内核 / 网卡 / qdisc / BBR / cake 支持）"
   say "  2) 一键优化 / 自定义配置（先分析再套用推荐值）"
   say "  3) 查看当前状态快照"
-  say "  4) 实时流量监控"
+  say "  4) 实时监控（总体 / 按客户端看每个 IP 的带宽）"
   say "  5) 停止整形并恢复原始 qdisc"
   say "  6) 开机自启（安装 / 移除 / 查看）"
   say "  7) 只改带宽（不动网卡与方向）"
@@ -1780,7 +1927,7 @@ main_menu() {
       1) show_env; preflight; pause ;;
       2) menu_enable ;;
       3) show_status; pause ;;
-      4) monitor ;;
+      4) menu_monitor ;;
       5) menu_stop ;;
       6) menu_service ;;
       7) menu_rate ;;
@@ -1803,7 +1950,8 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare apply          按配置启用（无交互，供 systemd 用）
   cake-fairshare stop           撤销整形并恢复原 qdisc
   cake-fairshare status         状态快照
-  cake-fairshare monitor [网卡] 实时监控
+  cake-fairshare monitor [网卡] 实时监控（整机）
+  cake-fairshare clients [秒]   实时监控（按客户端，默认 2 秒刷新）
   cake-fairshare log            采样一次（供 systemd timer 调用）
   cake-fairshare report [N]     查看最近 N 条采样
   cake-fairshare check          现场诊断（判断是否自身占满）
@@ -1831,6 +1979,7 @@ case "${1:-}" in
   stop)           require_root; do_stop ;;
   status)         require_root; show_status ;;
   monitor)        require_root; load_conf; monitor "${2:-}" ;;
+  clients)        require_root; load_conf; monitor_clients "${2:-2}" ;;
   log)            require_root; sample_once ;;
   sample)         require_root; sample_once ;;
   report)         require_root; show_report "${2:-30}" ;;
