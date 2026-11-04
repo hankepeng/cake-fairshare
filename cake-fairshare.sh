@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.4.1"
+VERSION="3.5.0"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -1755,6 +1755,206 @@ EOF
   systemctl enable --now cake-fairshare-speedtest.timer >/dev/null 2>&1
 }
 
+# ---------------------------------------------------------------- 在线升级 ----
+
+# 升级源。fork 了仓库就改这两个变量（或 export 覆盖）。
+UPGRADE_REPO="${UPGRADE_REPO:-hankepeng/cake-fairshare}"
+UPGRADE_BASE="${UPGRADE_BASE:-https://raw.githubusercontent.com/hankepeng/cake-fairshare/main}"
+
+script_version_of() {
+  grep -m1 '^VERSION=' "$1" 2>/dev/null \
+    | sed -E 's/^VERSION="?([^"]*)"?.*/\1/' | tr -d '\r'
+}
+
+ver_newer() {
+  # $1 是否严格新于 $2（用 sort -V 比较，支持 3.10.0 > 3.9.2）
+  local a="$1" b="$2"
+  [ -n "$a" ] || return 1
+  [ "$a" = "$b" ] && return 1
+  [ "$(printf '%s\n%s\n' "$b" "$a" | sort -V | tail -n1)" = "$a" ]
+}
+
+fetch_latest() {
+  # 下载最新脚本到 $1。0=成功 1=网络失败 2=没有下载工具
+  local dest="$1" url i rc
+  url="${UPGRADE_BASE%/}/cake-fairshare.sh"
+  if command -v curl >/dev/null 2>&1; then
+    # 优先走 API：raw 的 CDN 有缓存，刚发版时可能还拿到上一版（踩过一次）
+    for i in 1 2 3; do
+      if curl -fsSL --connect-timeout 8 --max-time 20 \
+        -H "Accept: application/vnd.github.raw" \
+        "https://api.github.com/repos/${UPGRADE_REPO}/contents/cake-fairshare.sh?ref=main" \
+        -o "$dest" 2>/dev/null && [ -s "$dest" ] && grep -q '^VERSION=' "$dest"; then
+        return 0
+      fi
+      [ "$i" -lt 3 ] && sleep 2
+    done
+    # API 限流或不可用时退回 raw
+    for i in 1 2; do
+      if curl -fsSL --connect-timeout 8 --max-time 25 -o "$dest" "$url" 2>/dev/null \
+        && [ -s "$dest" ] && grep -q '^VERSION=' "$dest"; then
+        return 0
+      fi
+      [ "$i" -lt 2 ] && sleep 2
+    done
+    return 1
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    for i in 1 2 3; do
+      if wget -q -O "$dest" --timeout=25 "$url" 2>/dev/null && [ -s "$dest" ]; then
+        return 0
+      fi
+      [ "$i" -lt 3 ] && sleep 2
+    done
+    return 1
+  fi
+  rc=2
+  return "$rc"
+}
+
+sync_units() {
+  # 把已安装的 systemd unit 同步到当前脚本的模板。
+  # 只补"缺关键行"的那些，不无脑重写——重写会重启服务，白抖一下。
+  local changed=""
+  if [ -f "$UNIT" ] && ! grep -qs 'ExecStop=/usr/local/sbin/cake-fairshare stop' "$UNIT"; then
+    if install_service >/dev/null 2>&1; then changed="${changed} 开机自启"; fi
+  fi
+  if [ -f "${LOG_UNIT%.service}.timer" ] && ! grep -qs 'OnUnitActiveSec=60s' "$LOG_UNIT"; then
+    if install_log_timer >/dev/null 2>&1; then changed="${changed} 每分钟采样"; fi
+  fi
+  if [ -f "${REPORT_UNIT%.service}.timer" ] && ! grep -qs '23:00:00' "$REPORT_UNIT"; then
+    if install_daily_timer >/dev/null 2>&1; then changed="${changed} 每日日报"; fi
+  fi
+  if [ -f "${SPEEDTEST_UNIT%.service}.timer" ]; then
+    if ! grep -qs 'Environment=HOME=' "$SPEEDTEST_UNIT" \
+      || ! grep -qs '00,30' "${SPEEDTEST_UNIT%.service}.timer"; then
+      if install_speedtest_timer >/dev/null 2>&1; then changed="${changed} 自动测速"; fi
+    fi
+  fi
+  if [ -n "$changed" ]; then
+    ok "已同步 unit 模板：${changed}"
+  else
+    dim "  unit 模板与当前版本一致，未重启任何服务"
+  fi
+}
+
+do_upgrade() {
+  local mode="ask" tmp new bak ans rc f
+  case "${1:-}" in
+    --check | check) mode="check" ;;
+    --yes | -y) mode="yes" ;;
+  esac
+  require_root
+  tmp=$(mktemp) || { bad "创建临时文件失败"; return 1; }
+
+  say ""
+  say "${B}在线升级${R}"
+  hr
+  printf '  当前版本  %s\n' "$VERSION"
+  printf '  升级源    %s\n' "$UPGRADE_REPO"
+  printf '  正在检查  '
+  fetch_latest "$tmp"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '\n'
+    rm -f "$tmp"
+    if [ "$rc" = "2" ]; then
+      bad "系统里既没有 curl 也没有 wget，无法在线升级"
+      dim "  装一个即可： apt install -y curl"
+    else
+      bad "连不上 GitHub（可能被墙，或需要代理）"
+      dim "  换个网络再试，或手动升级："
+      dim "    bash <(curl -fsSL ${UPGRADE_BASE}/install.sh)"
+    fi
+    logline "UPGRADE fail fetch rc=$rc"
+    return 1
+  fi
+  new=$(script_version_of "$tmp")
+  if [ -z "$new" ]; then
+    rm -f "$tmp"
+    bad "下载内容里读不到版本号，已放弃（可能是网络截断）"
+    logline "UPGRADE fail no-version"
+    return 1
+  fi
+  printf '%s\n' "$new"
+
+  if ! ver_newer "$new" "$VERSION"; then
+    rm -f "$tmp"
+    ok "已是最新版本（$VERSION）"
+    return 0
+  fi
+
+  # 先做语法检查，别把半截文件装上把工具搞坏
+  if ! bash -n "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    bad "新版本语法检查不通过，已放弃（现有版本未受影响）"
+    logline "UPGRADE fail syntax new=$new"
+    return 1
+  fi
+
+  hr
+  printf '  %b可升级：%s → %s%b\n' "$G" "$VERSION" "$new" "$R"
+  if [ "$mode" = "check" ]; then
+    rm -f "$tmp"
+    dim "  只检查，未做任何改动。要升级： cake upgrade"
+    return 0
+  fi
+  if [ "$mode" != "yes" ]; then
+    if [ ! -t 0 ]; then
+      rm -f "$tmp"
+      note "非交互环境，请显式确认： cake upgrade --yes"
+      return 1
+    fi
+    read -rp "  现在升级？[Y/n]: " ans
+    case "${ans:-Y}" in
+      n | N) rm -f "$tmp"; note "已取消"; return 0 ;;
+    esac
+  fi
+
+  bak="${SELF_INSTALL}.bak.${VERSION}"
+  if cp -a "$SELF_INSTALL" "$bak" 2>/dev/null; then
+    dim "  旧版已备份：$bak"
+  else
+    note "备份失败，继续升级（原文件仍在磁盘上）"
+  fi
+
+  if ! install -m 0755 "$tmp" "$SELF_INSTALL"; then
+    rm -f "$tmp"
+    bad "写入失败，旧版本未受影响"
+    logline "UPGRADE fail install"
+    return 1
+  fi
+  rm -f "$tmp"
+
+  # 落地后再确认一次版本号，防止写了一半
+  if [ "$(script_version_of "$SELF_INSTALL")" != "$new" ]; then
+    bad "写入后版本号对不上，正在回滚"
+    [ -f "$bak" ] && cp -a "$bak" "$SELF_INSTALL" 2>/dev/null
+    logline "UPGRADE fail verify"
+    return 1
+  fi
+  ok "已升级：$VERSION → $new"
+  logline "UPGRADE ok $VERSION -> $new"
+
+  # 旧备份只留 3 个
+  ls -1t "${SELF_INSTALL}".bak.* 2>/dev/null | tail -n +4 | while read -r f; do rm -f "$f"; done
+
+  say ""
+  # 后面全部用新二进制执行，确保跑的是新代码
+  "$SELF_INSTALL" sync-units 2>/dev/null || true
+  if [ -r "$CONF" ]; then
+    if "$SELF_INSTALL" apply >/dev/null 2>&1; then
+      ok "已按现有配置重新应用（带宽未变）"
+    else
+      note "重新应用失败，用第 3 项看一下状态"
+    fi
+  fi
+  say ""
+  dim "  新版本已生效，下次运行 cake 就是 $new"
+  [ -f "$bak" ] && dim "  要回退： install -m 0755 $bak $SELF_INSTALL"
+  return 0
+}
+
 install_log_timer() {
   cat >"$LOG_UNIT" <<'EOF'
 [Unit]
@@ -2157,6 +2357,7 @@ draw_menu() {
   say " 10) 采样日志与现场诊断"
   say " 11) 带宽健康报告（是否被限速，可给小白看）"
   say " 12) 立即测速并记录（马上跑，不等空闲）"
+  say " 13) 在线升级（检查并升级到 GitHub 最新版）"
   say "  0) 退出"
   hr
   # 主动提示：缺什么就直接说，不用用户自己去逐项翻
@@ -2192,6 +2393,7 @@ main_menu() {
       10) menu_log ;;
       11) health_report; pause ;;
       12) record_speedtest now; pause ;;
+      13) do_upgrade; pause ;;
       0|q|Q) say ""; exit 0 ;;
       *) note "无效输入"; sleep 1 ;;
     esac
@@ -2222,6 +2424,8 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare init [带宽] [--clean]
                                 一键配置并启用；--clean 自动停用冲突的限速服务
   cake-fairshare preflight      只检查环境，不改任何东西
+  cake-fairshare upgrade        检查并升级到最新版（--check 只看不升）
+  cake-fairshare sync-units     把 systemd unit 同步到当前版本的模板
   cake-fairshare --help
 
 配置：${CONF}
@@ -2258,6 +2462,12 @@ case "${1:-}" in
     require_root
     do_name "$@"
     ;;
+  upgrade)
+    shift
+    require_root
+    do_upgrade "${1:-}"
+    ;;
+  sync-units)     require_root; sync_units ;;
   preflight)      require_root; preflight ;;
   init)
     shift

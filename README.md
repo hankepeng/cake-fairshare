@@ -197,7 +197,7 @@ cake-fairshare optimize    # 分析 + 一键应用
 ## 交互菜单
 
 ```
-  CAKE 公平带宽分配 v3.4.1   美国1 · Debian GNU/Linux 12 (bookworm)
+  CAKE 公平带宽分配 v3.5.0   美国1 · Debian GNU/Linux 12 (bookworm)
 ------------------------------------------------------------
   状态：● 运行中      网卡 ens5   下行 168mbit / 上行 180mbit   方向 both
 ------------------------------------------------------------
@@ -213,6 +213,7 @@ cake-fairshare optimize    # 分析 + 一键应用
  10) 采样日志与现场诊断
  11) 带宽健康报告（是否被限速，可给小白看）
  12) 立即测速并记录（马上跑，不等空闲）
+ 13) 在线升级（检查并升级到 GitHub 最新版）
   0) 退出
 ------------------------------------------------------------
   建议 未开日报  → 选 2 一键补齐
@@ -240,6 +241,8 @@ cake-fairshare check            # 现场诊断：判断是自身占满还是链�
 cake-fairshare preflight        # 只检查环境冲突，不做任何改动
 cake-fairshare init [带宽] [--clean]   # 一键配置 + 启用 + 开机自启
 cake-fairshare health           # 带宽健康报告（限速历史，给小白看的版本）
+cake-fairshare upgrade           # 检查并升级到最新版（--check 只看不升）
+cake-fairshare sync-units        # 把 systemd unit 同步到当前版本的模板
 ```
 
 ## 环境预检与自动清理
@@ -426,6 +429,52 @@ AUTO_TEST_SERVER_ID=""     # 固定测速服务器 id；留空每次自动选最
 最后一行是白话结论，不用自己解读数据。
 
 > **采样看不出上游限速。** 被云厂商网关丢掉的包，系统里根本看不到，所以不存在"有连接但速度低 = 被限速"这种可靠判据（早期版本这么判过，实测 307 条连接 / 26 Mbps 就误报了）。判断有没有被限速，只能看历史测速记录。
+
+## 在线升级
+
+```bash
+cake upgrade            # 检查 → 确认 → 升级，一步到位
+cake upgrade --check    # 只看有没有新版，不动任何东西
+```
+
+菜单第 13 项等价。输出长这样：
+
+```
+在线升级
+------------------------------------------------------------
+  当前版本  3.4.1
+  升级源    hankepeng/cake-fairshare
+  正在检查  3.5.0
+------------------------------------------------------------
+  可升级：3.4.1 → 3.5.0
+  现在升级？[Y/n]:
+```
+
+升级过程做了这些保护：
+
+| 步骤 | 说明 |
+|---|---|
+| 下载 | 先走 GitHub API（raw 的 CDN 有缓存，刚发版可能拿到上一版），失败退回 raw，都失败给出手动命令 |
+| 语法检查 | `bash -n` 不通过就放弃，绝不把半截文件装上去 |
+| 备份 | 旧版存成 `/usr/local/sbin/cake-fairshare.bak.<旧版本>`，只保留最近 3 个 |
+| 写入校验 | 落地后再读一次版本号，对不上自动回滚 |
+| 同步 unit | 调用 `sync-units`，只补 unit 里缺的关键行（比如 speedtest 的 `Environment=HOME=`），不会无谓重启服务 |
+| 重新应用 | 用**新**二进制跑一次 `apply`，带宽配置不变 |
+
+回退很简单，备份文件名带版本号：
+
+```bash
+sudo install -m 0755 /usr/local/sbin/cake-fairshare.bak.3.4.1 /usr/local/sbin/cake-fairshare
+```
+
+> 改了仓库地址（fork、自建镜像）就改脚本顶部两行：
+> ```bash
+> UPGRADE_REPO="你的用户名/cake-fairshare"
+> UPGRADE_BASE="https://raw.githubusercontent.com/你的用户名/cake-fairshare/main"
+> ```
+> 也可以用环境变量临时覆盖。
+
+**连不上 GitHub** 会明确提示并给出手动命令，不会卡住或留下半成品。脚本化调用请用 `cake upgrade --yes`（非交互环境下不带 `--yes` 会拒绝自动升级）。
 
 ## 文件位置
 
