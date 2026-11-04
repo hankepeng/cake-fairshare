@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.2"
+VERSION="3.6.3"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -2032,13 +2032,22 @@ do_upgrade() {
     note "备份失败，继续升级（原文件仍在磁盘上）"
   fi
 
-  if ! install -m 0755 "$tmp" "$SELF_INSTALL"; then
-    rm -f "$tmp"
-    bad "写入失败，旧版本未受影响"
-    logline "UPGRADE fail install"
+  # 不能直接 install 覆盖正在运行的脚本：同名写入会截断当前进程正在读的文件，
+  # 部分环境还会报 Text file busy。先装到同目录临时名，再原子 mv 替换。
+  local newbin="${SELF_INSTALL}.new.$$"
+  if ! install -m 0755 "$tmp" "$newbin" 2>/dev/null; then
+    rm -f "$tmp" "$newbin"
+    bad "写入失败（检查 /usr/local/sbin 的权限与磁盘空间），旧版本未受影响"
+    logline "UPGRADE fail stage"
     return 1
   fi
   rm -f "$tmp"
+  if ! mv -f "$newbin" "$SELF_INSTALL" 2>/dev/null; then
+    rm -f "$newbin"
+    bad "替换失败，旧版本未受影响"
+    logline "UPGRADE fail mv"
+    return 1
+  fi
 
   # 落地后再确认一次版本号，防止写了一半
   if [ "$(script_version_of "$SELF_INSTALL")" != "$new" ]; then
@@ -2064,6 +2073,10 @@ do_upgrade() {
     fi
   fi
   say ""
+  if [ "${MENU_MODE:-0}" -eq 1 ]; then
+    dim "  正在重新载入 v${new} 菜单..."
+    exec "$SELF_INSTALL"
+  fi
   dim "  新版本已生效，下次运行 cake 就是 $new"
   [ -f "$bak" ] && dim "  要回退： install -m 0755 $bak $SELF_INSTALL"
   return 0
@@ -2505,6 +2518,7 @@ draw_menu() {
 
 main_menu() {
   require_root
+  MENU_MODE=1
   local choice
   while true; do
     draw_menu
