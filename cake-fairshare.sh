@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.6"
+VERSION="3.6.7"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -2680,6 +2680,7 @@ EOF
 case "${1:-}" in
   "")             main_menu ;;
   apply)          require_root; do_apply ;;
+  start)          require_root; do_apply ;;
   optimize)
     shift
     require_root
