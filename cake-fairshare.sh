@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.7.0"
+VERSION="2.8.0"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -119,6 +119,7 @@ normalize_rate() {
 
 # ------------------------------------------------------------ 配置与状态 ----
 load_conf() {
+  NODE_NAME=""
   IFACES=""; RATE="$DEF_RATE"; MODE="both"
   RATE_EGRESS=""; RATE_INGRESS=""
   CAKE_OPTS=""; CAKE_OPTS_INGRESS="$DEF_CAKE_OPTS_INGRESS"
@@ -130,6 +131,7 @@ save_conf() {
   mkdir -p "$CONF_DIR"
   {
     printf '# 由 cake-fairshare 生成，手工修改后执行 apply 生效\n'
+    printf 'NODE_NAME="%s"\n' "${NODE_NAME:-}"
     printf 'IFACES="%s"\n' "$IFACES"
     printf 'RATE="%s"\n' "$RATE"
     printf 'MODE="%s"\n' "$MODE"
@@ -427,6 +429,7 @@ show_env() {
   say ""
   say "${B}环境信息${R}"
   hr
+  printf '  节点名称  : %s\n' "${NODE_NAME:-(未命名，用 cake-fairshare name 设置)}"
   printf '  系统      : %s\n' "$(os_pretty)"
   printf '  内核      : %s\n' "$(uname -r)"
   printf '  拥塞控制  : %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
@@ -482,6 +485,7 @@ show_status() {
   say ""
   if [ ! -r "$CONF" ]; then note "尚未配置，无状态可看"; return 0; fi
   load_conf
+  if [ -n "${NODE_NAME:-}" ]; then say "${B}$NODE_NAME${R}"; fi
   for ifc in $IFACES; do
     if ! ip link show "$ifc" >/dev/null 2>&1; then bad "$ifc 不存在"; continue; fi
     say "${B}$ifc  （出口）${R}"
@@ -527,6 +531,22 @@ monitor() {
 }
 
 # ---------------------------------------------------------------- 菜单动作 ----
+do_name() {
+  load_conf
+  if [ -z "${1:-}" ]; then
+    printf '%s\n' "${NODE_NAME:-(未命名)}"
+    return 0
+  fi
+  if [ ! -r "$CONF" ]; then
+    bad "还没有配置，先运行 cake-fairshare init"
+    return 1
+  fi
+  NODE_NAME="$*"
+  save_conf
+  ok "节点名称已设为：$NODE_NAME"
+  dim "  菜单、status、health、日报都会显示这个名字"
+}
+
 menu_enable() {
   local ifc_list def sel rate mode confirm chosen n pick ifc i ack def_idx=1
   ifc_list=$(list_ifaces)
@@ -1053,7 +1073,11 @@ health_report() {
   fi
 
   say ""
-  say "${B}带宽健康报告${R}"
+  if [ -n "${NODE_NAME:-}" ]; then
+    say "${B}带宽健康报告${R}  ${D}[$NODE_NAME]${R}"
+  else
+    say "${B}带宽健康报告${R}"
+  fi
   hr
   printf '  整形上限：下行 %s Mbps / 上行 %s Mbps\n' "$cap_e" "$cap_i"
   printf '  采样样本：%s 条（每分钟 1 条，约 %s 分钟）\n' "$n" "$n"
@@ -1157,7 +1181,7 @@ daily_report() {
   load_conf
   mkdir -p "$(dirname "$DAILY_LOG")" 2>/dev/null
   {
-    printf '\n===== %s =====\n' "$(date '+%F %H:%M')"
+    printf '\n===== %s%s =====\n' "${NODE_NAME:+$NODE_NAME  }" "$(date '+%F %H:%M')"
     health_report
   } >>"$DAILY_LOG" 2>&1
 }
@@ -1259,9 +1283,14 @@ EOF
 
 # ---------------------------------------------------------------- 主菜单 ----
 draw_menu() {
+  load_conf
   if [ -t 1 ]; then clear; fi
   say ""
-  printf '%b  CAKE 公平带宽分配 v%s%b   %b%s%b\n' "$B" "$VERSION" "$R" "$D" "$(os_pretty)" "$R"
+  if [ -n "${NODE_NAME:-}" ]; then
+    printf '%b  CAKE 公平带宽分配 v%s%b   %b%s · %s%b\n' "$B" "$VERSION" "$R" "$D" "$NODE_NAME" "$(os_pretty)" "$R"
+  else
+    printf '%b  CAKE 公平带宽分配 v%s%b   %b%s%b\n' "$B" "$VERSION" "$R" "$D" "$(os_pretty)" "$R"
+  fi
   hr
   if is_active; then
     printf '  状态：%b● 运行中%b' "$G" "$R"
@@ -1327,6 +1356,7 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare check          现场诊断（判断是否自身占满）
   cake-fairshare health         带宽健康报告（限速历史）
   cake-fairshare daily          生成一次日报（供 timer 调用）
+  cake-fairshare name [名称]    设置/查看节点名称
   cake-fairshare init [带宽] [--clean]
                                 一键配置并启用；--clean 自动停用冲突的限速服务
   cake-fairshare preflight      只检查环境，不改任何东西
@@ -1350,6 +1380,11 @@ case "${1:-}" in
   check)          require_root; load_conf; diagnose "${2:-}" ;;
   health)         require_root; health_report ;;
   daily)          require_root; load_conf; daily_report ;;
+  name)
+    shift
+    require_root
+    do_name "$@"
+    ;;
   preflight)      require_root; preflight ;;
   init)
     shift

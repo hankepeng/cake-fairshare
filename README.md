@@ -129,7 +129,7 @@ sudo cake-fairshare init
 ## 交互菜单
 
 ```
-  CAKE 公平带宽分配 v2.7.0   Debian GNU/Linux 12 (bookworm)
+  CAKE 公平带宽分配 v2.8.0   Debian GNU/Linux 12 (bookworm)
 ------------------------------------------------------------
   状态：○ 未启用      网卡 eth0   带宽 95mbit   方向 both
 ------------------------------------------------------------
@@ -269,6 +269,7 @@ cake-fairshare health
 配置文件各字段：
 
 ```bash
+NODE_NAME="新加坡1"        # 节点名称，显示在菜单/status/health/日报里
 IFACES="eth0"              # 网卡，多块用空格分隔
 RATE="160mbit"             # 基准带宽，上下行都用它
 MODE="both"                # both = 双向整形；down = 只整形出口
