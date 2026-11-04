@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.5.1 — 2026-11-04
+
+### 修复
+
+- **`sync-units` 每次都白重写 timer**。判断 log / report 是否需要同步时，grep 的是 `.service` 文件，但 `OnUnitActiveSec` 和 `OnCalendar` 写在 `.timer` 里——条件永远成立，于是每次升级都会把这两个 timer 重写启一遍。
+  改成 grep 对应的 `.timer` 文件后，连续两次 `cake sync-units` 都是「unit 模板与当前版本一致，未重启任何服务」。
+
 ## v3.5.0 — 2026-11-04
 
 ### 新增：在线升级

@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.5.0"
+VERSION="3.5.1"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -1819,10 +1819,12 @@ sync_units() {
   if [ -f "$UNIT" ] && ! grep -qs 'ExecStop=/usr/local/sbin/cake-fairshare stop' "$UNIT"; then
     if install_service >/dev/null 2>&1; then changed="${changed} 开机自启"; fi
   fi
-  if [ -f "${LOG_UNIT%.service}.timer" ] && ! grep -qs 'OnUnitActiveSec=60s' "$LOG_UNIT"; then
+  # 注意 grep 的是 .timer 文件：OnUnitActiveSec / OnCalendar 写在 timer 里，
+  # 拿 .service 去 grep 永远查不到，会每次升级都白重写一遍。
+  if [ -f "${LOG_UNIT%.service}.timer" ] && ! grep -qs 'OnUnitActiveSec=60s' "${LOG_UNIT%.service}.timer"; then
     if install_log_timer >/dev/null 2>&1; then changed="${changed} 每分钟采样"; fi
   fi
-  if [ -f "${REPORT_UNIT%.service}.timer" ] && ! grep -qs '23:00:00' "$REPORT_UNIT"; then
+  if [ -f "${REPORT_UNIT%.service}.timer" ] && ! grep -qs '23:00:00' "${REPORT_UNIT%.service}.timer"; then
     if install_daily_timer >/dev/null 2>&1; then changed="${changed} 每日日报"; fi
   fi
   if [ -f "${SPEEDTEST_UNIT%.service}.timer" ]; then
