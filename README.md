@@ -129,7 +129,7 @@ sudo cake-fairshare init
 ## 交互菜单
 
 ```
-  CAKE 公平带宽分配 v2.6.1   Debian GNU/Linux 12 (bookworm)
+  CAKE 公平带宽分配 v2.6.2   Debian GNU/Linux 12 (bookworm)
 ------------------------------------------------------------
   状态：○ 未启用      网卡 eth0   带宽 95mbit   方向 both
 ------------------------------------------------------------

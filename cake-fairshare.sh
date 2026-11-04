@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.6.1"
+VERSION="2.6.2"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -492,7 +492,8 @@ show_status() {
     fi
     say ""
   done
-  dim "  overlimits/drops 持续增长 = 限速已生效在压；backlog 长期堆满 = 带宽设高了。"
+  dim "  判读：backlog 长期 0 = 没到上限；backlog 持续堆积 / drops 增长 = 正在压制。"
+  dim "        overlimits 只是被整形器调度过的包数，不等于超速次数，别当比例看。"
 }
 
 monitor() {
