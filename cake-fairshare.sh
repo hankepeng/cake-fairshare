@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.0"
+VERSION="3.6.1"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -2174,7 +2174,7 @@ recommend_rate() {
     REC_IN=${cur_in:-$cur_eg}
     REC_WHY="沿用当前出口 ${cur_eg} / 入口 ${REC_IN} Mbps（已在限速，不自动改动这个数字）"
     if awk -v p="$pu" -v c="$cur_eg" 'BEGIN{exit !(p > c * 2)}'; then
-      REC_HINT="测速历史里出方向到过 ${pu} Mbps，是当前上限的 $((pu / cur_eg * 100 / 100)) 倍多——那次多半是关掉整形测的，不能当稳态能力"
+      REC_HINT="测速历史里出方向到过 ${pu} Mbps，是当前上限的 $(awk -v p="$pu" -v c="$cur_eg" 'BEGIN{printf "%d", p / c}') 倍多——那次多半是关掉整形测的，不能当稳态能力"
     elif awk -v p="$pu" -v c="$cur_eg" 'BEGIN{exit !(p > c * 1.02)}'; then
       REC_SUGGEST=$(awk -v p="$pu" 'BEGIN{printf "%d", p * 0.95}')
       REC_HINT="测速历史里出方向到过 ${pu} Mbps，比当前上限 ${cur_eg} 高；若套餐带宽确实更大，可上调到 ${REC_SUGGEST} Mbps"
@@ -2466,7 +2466,7 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare stop           撤销整形并恢复原 qdisc
   cake-fairshare status         状态快照
   cake-fairshare monitor [网卡] 实时监控（整机）
-  cake-fairshare clients [秒] [行数]   按客户端实时监控（默认 2 秒 / 8 行）
+  cake-fairshare clients [秒] [行数]   按客户端实时监控（默认 2 秒 / 10 行）
   cake-fairshare log            采样一次（供 systemd timer 调用）
   cake-fairshare report [N]     查看最近 N 条采样
   cake-fairshare check          现场诊断（判断是否自身占满）

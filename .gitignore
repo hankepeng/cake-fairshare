@@ -3,3 +3,5 @@
 *.swo
 .DS_Store
 Thumbs.db
+# 本地上传的私有资料（交接文档等），不进入仓库
+.uploads/

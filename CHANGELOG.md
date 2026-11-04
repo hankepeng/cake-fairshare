@@ -1,5 +1,20 @@
 # Changelog
 
+## v3.6.1 — 2026-11-04
+
+### 修复
+
+- **`analyze` / `optimize` 在已配置节点上直接中断**。`recommend_rate` 用整数算术 `$((pu / cur_eg * 100 / 100))` 算"测速峰值是当前上限的几倍"，而峰值来自 `speedtest_peaks` 的 `%.1f`（如 `415.12`）。bash 遇到浮点报 `syntax error: invalid arithmetic operator`，非交互脚本立即退出——触发条件正是它要提醒的场景：已配置且历史峰值 > 2× 当前上限。改为 awk 计算。
+- **帮助文本 `clients` 默认行数写错**：写 8 行，实际默认 10 行（README 也是 10）。
+
+### 回归验证
+
+| 测试 | 结果 |
+|---|---|
+| 190mbit 配置 + 415.12 峰值历史 → `analyze` | 正常输出"是当前上限的 2 倍多"，rc=0（修复前 rc=1） |
+| `bash -n` + `shellcheck -S warning` | 0 告警 |
+| `status` / `preflight` / `report` / `analyze` | 全部 rc=0 |
+
 ## v3.6.0 — 2026-11-04
 
 定版审计：shellcheck 0 error / 0 warning + 逐函数人工审查 + 异常路径实测。查出并修复 9 处逻辑缺陷。
