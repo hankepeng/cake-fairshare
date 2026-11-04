@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.5.1"
+VERSION="3.6.0"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -316,6 +316,17 @@ apply_one() {
   r_eg="${RATE_EGRESS:-$rate}"
   r_in="${RATE_INGRESS:-$rate}"
 
+  # 带宽值非法时 tc 会失败，但错误被 2>/dev/null 吞掉，
+  # 只报"检查 CAKE_OPTS"会把人带偏。先自己校验一遍。
+  case "$r_eg" in
+    [0-9]*mbit | [0-9]*gbit) ;;
+    *)
+      bad "出口带宽值无效：'${r_eg:-空}'（应形如 190mbit / 1gbit）"
+      logline "FAIL $ifc bad-egress-rate '[${r_eg}]'"
+      return 1
+      ;;
+  esac
+
   cur=$(root_qdisc "$ifc")
   # 注意：不要把 mq 当成障碍。多队列网卡的 root 是 mq，但 replace 到 cake 是允许的，
   # 只有 replace 真失败时才需要降到单队列（见下方失败分支）。
@@ -378,11 +389,30 @@ apply_one() {
       # （实测某节点 4 天丢 280 万个包）。放到 1000，让 cake 自己去管排队。
       ip link set "$ifb" txqueuelen 1000 2>/dev/null
       tc qdisc del dev "$ifc" ingress >/dev/null 2>&1
-      tc qdisc add dev "$ifc" handle ffff: ingress 2>/dev/null
-      tc filter add dev "$ifc" parent ffff: protocol all u32 \
-          match u32 0 0 action mirred egress redirect dev "$ifb" >/dev/null 2>&1
+      # 入口这三步原来不校验返回值：任意一步失败，仍在后面打印"✓ 入口整形"，
+      # 实际入口方向完全没生效，排查时会被这条假成功带偏。
+      if ! tc qdisc add dev "$ifc" handle ffff: ingress 2>/dev/null; then
+        bad "入口 ingress 队列创建失败，仅出口方向生效"
+        ip link del "$ifb" >/dev/null 2>&1
+        logline "FAIL $ifc ingress-add"
+        return 0
+      fi
+      if ! tc filter add dev "$ifc" parent ffff: protocol all u32 \
+          match u32 0 0 action mirred egress redirect dev "$ifb" >/dev/null 2>&1; then
+        bad "入口重定向规则添加失败，仅出口方向生效"
+        tc qdisc del dev "$ifc" ingress >/dev/null 2>&1
+        ip link del "$ifb" >/dev/null 2>&1
+        logline "FAIL $ifc ingress-filter"
+        return 0
+      fi
       # shellcheck disable=SC2086
-      tc qdisc replace dev "$ifb" root cake bandwidth "$r_in" dual-srchost ${CAKE_OPTS:-} ${CAKE_OPTS_INGRESS:-} 2>/dev/null
+      if ! tc qdisc replace dev "$ifb" root cake bandwidth "$r_in" dual-srchost ${CAKE_OPTS:-} ${CAKE_OPTS_INGRESS:-} 2>/dev/null; then
+        bad "在 $ifb 上挂 cake 失败（检查入口带宽 / CAKE_OPTS），仅出口方向生效"
+        tc qdisc del dev "$ifc" ingress >/dev/null 2>&1
+        ip link del "$ifb" >/dev/null 2>&1
+        logline "FAIL $ifb cake-replace rate=$r_in opts=[${CAKE_OPTS:-}|${CAKE_OPTS_INGRESS:-}]"
+        return 0
+      fi
       put_state "$ifc" IFB "$ifb"
       ok "入口整形：$ifc -> $ifb  cake bandwidth $r_in dual-srchost ${CAKE_OPTS:-} ${CAKE_OPTS_INGRESS:-}"
     else
@@ -423,7 +453,7 @@ stop_one() {
 do_apply() {
   load_conf
   [ -n "$IFACES" ] || die "尚未配置网卡，请先运行交互菜单"
-  local rc=0
+  local rc=0 ifc
   for ifc in $IFACES; do
     if ! ip link show "$ifc" >/dev/null 2>&1; then
       bad "网卡 $ifc 不存在，跳过"
@@ -438,6 +468,7 @@ do_apply() {
 
 do_stop() {
   load_conf
+  local ifc
   for ifc in $IFACES; do
     ip link show "$ifc" >/dev/null 2>&1 || continue
     stop_one "$ifc"
@@ -564,7 +595,7 @@ client_snapshot() {
   [ -n "$lports" ] || lports=$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed -E 's/.*://' | grep -vx '22' | sort -u | tr '\n' ',')
   [ -n "$lports" ] || return 0
   ss -Htni state established 2>/dev/null | awk -v lp=",$lports" '
-    NF >= 4 && $3 ~ /:[0-9]+$/ && $4 ~ /:[0-9]+$/ {
+    NF >= 4 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /:[0-9]+$/ && $4 ~ /:[0-9]+$/ {
       n = split($3, a, ":")
       if (index(lp, "," a[n] ",") > 0) {
         ip = $4
@@ -624,7 +655,7 @@ monitor_clients() {
   # 监听端口在一次观察期间不会变，算一次就够
   local lports
   lports=$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed -E 's/.*://' | grep -vx '22' | sort -u | tr '\n' ',')
-  [ -n "$lports" ] || { note "没找到正在监听的代理端口（XrayR 没跑？）"; rm -f "$f1" "$f2"; return 1; }
+  [ -n "$lports" ] || { note "没找到正在监听的代理端口（XrayR 没跑？）"; rm -f "$f1" "$f2" "$f3"; return 1; }
   ifb=$(get_state "$ifc" IFB)
   trap 'stop=1' INT
   # 只在一开始清一次屏。之后每帧把光标移回左上角就地覆盖，
@@ -814,7 +845,14 @@ menu_custom() {
   cur="${RATE:-}"
   ifc_list=$(list_ifaces)
   if [ -z "$ifc_list" ]; then bad "没有可用的物理网卡"; pause; return 1; fi
+  # 默认选中"默认路由那块"而不是列表第一项：
+  # 多网卡机器上第一项常是内网卡，直接回车会配错地方。
   def=$(primary_iface)
+  i=0
+  for ifc in $ifc_list; do
+    i=$((i + 1))
+    [ "$ifc" = "$def" ] && def_idx=$i
+  done
 
   # 先扫一遍环境：别的限速脚本/服务会和我们抢根队列，越早处理越好
   if ! preflight; then
@@ -1292,7 +1330,8 @@ sample_once() {
   [ -n "${lts:-}" ] || return 0
   dt=$((now - lts))
   [ "$dt" -gt 0 ] || return 0
-  [ "$rx" -ge "${lrx:-0}" ] || return 0
+  # 两个方向的计数器都要防回绕：只查 rx 的话，网卡重置后 tx 会算出负速率写进日志
+  { [ "$rx" -ge "${lrx:-0}" ] && [ "$tx" -ge "${ltx:-0}" ]; } || return 0
 
   local rx_m tx_m eo ed io cn eb ib
   rx_m=$(awk -v a="$lrx" -v b="$rx" -v t="$dt" 'BEGIN{printf "%.2f",(b-a)*8/t/1000000}')
@@ -1318,7 +1357,7 @@ sample_once() {
       | grep -vx '22' | sort -u | tr '\n' ',')
     if [ -n "$lports" ]; then
       read -r c1 a1 c2 a2 c3 a3 <<<"$(ss -Htn state established 2>/dev/null \
-        | awk -v lp=",$lports" '{
+        | awk -v lp=",$lports" '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
             n = split($3, a, ":")
             if (index(lp, "," a[n] ",") > 0) print $4
           }' \
@@ -2074,7 +2113,10 @@ client_ip_count() {
   lports=$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed -E 's/.*://' | grep -vx '22' | sort -u | tr '\n' ',')
   if [ -z "$lports" ]; then printf '0\n'; return 0; fi
   ss -Htn state established 2>/dev/null \
-    | awk -v lp=",$lports" '{ n = split($3, a, ":"); if (index(lp, "," a[n] ",") > 0) print $4 }' \
+    | awk -v lp=",$lports" '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+        n = split($3, a, ":")
+        if (index(lp, "," a[n] ",") > 0) print $4
+      }' \
     | sed -E 's/:[0-9]+$//' | sort -u | wc -l | tr -d ' '
 }
 
@@ -2210,7 +2252,10 @@ render_analysis() {
 }
 
 do_optimize() {
-  local ifc ans shapers
+  local ifc ans shapers opt_yes=0 all_ifaces
+  case "${1:-}" in
+    --yes | -y) opt_yes=1 ;;
+  esac
   load_conf
   require_root
 
@@ -2262,15 +2307,24 @@ do_optimize() {
   case "$miss" in *每分钟采样*) say "  · 每分钟采样  开启" ;; esac
   case "$miss" in *每日日报*) say "  · 每日日报  开启（每天 23:00）" ;; esac
   say ""
-  read -rp "  确认执行？[Y/n]: " ans
-  case "${ans:-Y}" in
-    n | N) note "已取消"; return 0 ;;
-  esac
+  if [ "$opt_yes" -ne 1 ]; then
+    if [ ! -t 0 ]; then
+      note "非交互环境，未执行任何改动。要自动执行请加 --yes： cake optimize --yes"
+      return 1
+    fi
+    read -rp "  确认执行？[Y/n]: " ans || ans="n"
+    case "${ans:-Y}" in
+      n | N) note "已取消"; return 0 ;;
+    esac
+  fi
 
   say ""
   if [ -n "$shapers" ]; then cleanup_conflicts; fi
 
-  IFACES="$ifc"; RATE="${REC_EG}mbit"; MODE="both"
+  # 原来直接 IFACES="$ifc"，会把多网卡机器静默缩成一块，其余网卡的整形配置凭空消失。
+  all_ifaces="${IFACES:-$ifc}"
+  [ -n "$all_ifaces" ] || all_ifaces="$ifc"
+  IFACES="$all_ifaces"; RATE="${REC_EG}mbit"; MODE="both"
   RATE_EGRESS=""
   if [ "${REC_IN}" -ne "${REC_EG}" ]; then
     RATE_INGRESS="${REC_IN}mbit"
@@ -2421,7 +2475,8 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare speedtest      立即测速一次并记入历史
   cake-fairshare speedtest --auto   先等链路空闲再测（定时器用这个）
   cake-fairshare name [名称]    设置/查看节点名称
-  cake-fairshare optimize       分析机器并一键套用推荐配置（最常用）
+  cake-fairshare optimize [--yes]
+                                分析机器并一键套用推荐配置（最常用）
   cake-fairshare analyze        只分析、给推荐，不改任何东西
   cake-fairshare init [带宽] [--clean]
                                 一键配置并启用；--clean 自动停用冲突的限速服务
@@ -2439,7 +2494,11 @@ EOF
 case "${1:-}" in
   "")             main_menu ;;
   apply)          require_root; do_apply ;;
-  optimize)       require_root; do_optimize ;;
+  optimize)
+    shift
+    require_root
+    do_optimize "${1:-}"
+    ;;
   analyze|advise) require_root; do_analyze ;;
   stop)           require_root; do_stop ;;
   status)         require_root; show_status ;;
