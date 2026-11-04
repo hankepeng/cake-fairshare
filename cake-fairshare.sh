@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.8.1"
+VERSION="2.8.2"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -940,13 +940,23 @@ sample_once() {
   [ -n "$ifb" ] && io=$(qdisc_stat "$ifb" overlimits)
   cn=$(ss -Htn state established 2>/dev/null | wc -l | tr -d ' ')
 
-  # 记录连接数最多的 3 个对端 IP（用于区分"多设备"与"多人共用出口"）
-  local a1="" c1="" a2="" c2="" a3="" c3=""
+  # 记录连接数最多的 3 个客户端 IP（用于区分"多设备"与"多人共用出口"）
+  # 必须按"本地端口是监听端口"筛选：established 里同时包含 XrayR 出站到目标站的连接，
+  # 不过滤会把 CDN/苹果这类目标的 IP 当成客户端（实测某节点首位是苹果的 17.253.x.x）。
+  local a1="" c1="" a2="" c2="" a3="" c3="" lports=""
   if [ "${cn:-0}" -gt 0 ]; then
-    read -r c1 a1 c2 a2 c3 a3 <<<"$(ss -Htn state established 2>/dev/null \
-      | awk '{print $4}' | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff://' \
-      | sort | uniq -c | sort -rn | head -3 \
-      | awk '{printf "%s %s ", $1, $2}')"
+    lports=$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed -E 's/.*://' \
+      | grep -vx '22' | sort -u | tr '\n' ',')
+    if [ -n "$lports" ]; then
+      read -r c1 a1 c2 a2 c3 a3 <<<"$(ss -Htn state established 2>/dev/null \
+        | awk -v lp=",$lports" '{
+            n = split($3, a, ":")
+            if (index(lp, "," a[n] ",") > 0) print $4
+          }' \
+        | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff://' \
+        | sort | uniq -c | sort -rn | head -3 \
+        | awk '{printf "%s %s ", $1, $2}')"
+    fi
   fi
 
   printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date '+%F %T')" "$rx_m" "$tx_m" \
