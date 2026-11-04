@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.1.0"
+VERSION="3.1.1"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -597,12 +597,15 @@ QD_AWK='
 monitor_clients() {
   require_root
   load_conf
-  local ifc interval="${1:-2}" cap_e cap_i f1 f2 t1 t2 stop=0 eb ib ifb lports
+  local ifc interval="${1:-2}" rows="${2:-8}" cap_e cap_i f1 f2 t1 t2 stop=0 eb ib ifb lports
   ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
   [ -n "$ifc" ] || ifc=$(primary_iface)
   [ -n "$ifc" ] || { note "没有可用网卡"; return 1; }
   case "$interval" in '' | *[!0-9]*) interval=2 ;; esac
   [ "$interval" -ge 1 ] || interval=1
+  case "$rows" in '' | *[!0-9]*) rows=8 ;; esac
+  [ "$rows" -ge 3 ] 2>/dev/null || rows=8
+  [ "$rows" -le 40 ] 2>/dev/null || rows=40
   cap_e=$(unit_num "${RATE_EGRESS:-$RATE}")
   cap_i=$(unit_num "${RATE_INGRESS:-$RATE}")
 
@@ -628,7 +631,7 @@ monitor_clients() {
     # 中文是 3 字节但只占 2 列宽，交给它排必然错位。
     say "  客户端 IP            连接       下行       上行       合计  占份额"
     say "  --------------------  ----  ---------  ---------  ---------  -------"
-    awk -v t="$t1" -v t2="$t2" -v ce="$cap_e" -v ci="$cap_i" '
+    awk -v t="$t1" -v t2="$t2" -v ce="$cap_e" -v TBL="$rows" '
       BEGIN { dt = (t2 - t) / 1000000; if (dt <= 0) dt = 1 }
       FNR == NR { s1[$1] = $2; r1[$1] = $3; next }
       {
@@ -639,31 +642,58 @@ monitor_clients() {
         if (up < 0) up = 0
         n++
         IP[n] = ip; DN[ip] = dn; UP[ip] = up; CN[ip] = $4
-        if (dn + up > 0.05) act++
+        if (dn + up >= 0.05) act++
         TD += dn; TU += up
       }
       END {
+        # 按合计速率降序
         for (i = 1; i <= n; i++) {
           bi = i
           for (j = i + 1; j <= n; j++)
-            if (DN[IP[j]] + UP[IP[j]] > DN[IP[bi]] + UP[IP[bi]]) bi = j
+            if (DN[IP[j]] + UP[IP[j]] > DN[IP[bi]] + UP[bi]) bi = j
           k = IP[i]; IP[i] = IP[bi]; IP[bi] = k
         }
         sh = (act > 0) ? ce / act : 0
-        shown = 0
-        for (i = 1; i <= n && shown < 12; i++) {
+
+        m = 0
+        for (i = 1; i <= n; i++) {
           ip = IP[i]
-          if (DN[ip] + UP[ip] < 0.01) continue
-          pct = (sh > 0) ? (DN[ip] + UP[ip]) * 100 / sh : 0
-          printf "  %-20s %4d %10.2f %10.2f %10.2f %6.0f%%\n", ip, CN[ip], DN[ip], UP[ip], DN[ip] + UP[ip], pct
-          shown++
+          if (DN[ip] + UP[ip] < 0.05) continue
+          m++
+          AI[m] = ip
         }
-        if (shown == 0) printf "  （当前没有在传输数据的客户端）\n"
+
+        # 表格固定占 TBL 行。否则客户端数量一变，下面的汇总行就跟着上下跳，
+        # 盯着看很晃眼。超出部分折成一行提示。
+        if (m == 0) {
+          printf "  （当前没有在传输数据的客户端）\n"
+          used = 1
+        } else {
+          show = (m > TBL) ? TBL - 1 : m
+          for (i = 1; i <= show; i++) {
+            ip = AI[i]
+            pct = (sh > 0) ? (DN[ip] + UP[ip]) * 100 / sh : 0
+            printf "  %-20s %4d %10.2f %10.2f %10.2f %6.0f%%\n", ip, CN[ip], DN[ip], UP[ip], DN[ip] + UP[ip], pct
+          }
+          used = show
+          if (m > TBL) {
+            printf "  ... 另有 %d 个客户端在传输（已按速率排序，只显示前 %d 个）\n", m - show, show
+            used++
+          }
+        }
+        for (i = used; i < TBL; i++) printf "\n"
+
+        # 汇总固定三行，不随客户端数量增减
         printf "\n"
         printf "  活跃客户端 %d 个（有流量的）   合计 下行 %.2f / 上行 %.2f Mbps\n", act, TD, TU
-        if (ce > 0 && act > 0)
+        if (act > 0 && ce > 0)
           printf "  每人估算份额 %.1f Mbps（%d ÷ %d）   出口占用 %.0f%%\n", sh, ce, act, TD * 100 / ce
-        if (n > act) printf "  另有 %d 个客户端连着但没有流量（不占份额）\n", n - act
+        else
+          printf "  每人估算份额 --（当前没有客户端在传数据）   出口占用 0%%\n"
+        if (n > act)
+          printf "  另有 %d 个客户端连着但没有流量（不占份额）\n", n - act
+        else
+          printf "  所有在线的客户端都有流量\n"
       }' "$f1" "$f2"
     hr
     # 一次 tc 同时取出口和入口的积压，别为两个数起两次进程。
@@ -1951,7 +1981,7 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare stop           撤销整形并恢复原 qdisc
   cake-fairshare status         状态快照
   cake-fairshare monitor [网卡] 实时监控（整机）
-  cake-fairshare clients [秒]   实时监控（按客户端，默认 2 秒刷新）
+  cake-fairshare clients [秒] [行数]   按客户端实时监控（默认 2 秒 / 8 行）
   cake-fairshare log            采样一次（供 systemd timer 调用）
   cake-fairshare report [N]     查看最近 N 条采样
   cake-fairshare check          现场诊断（判断是否自身占满）
@@ -1979,7 +2009,7 @@ case "${1:-}" in
   stop)           require_root; do_stop ;;
   status)         require_root; show_status ;;
   monitor)        require_root; load_conf; monitor "${2:-}" ;;
-  clients)        require_root; load_conf; monitor_clients "${2:-2}" ;;
+  clients)        require_root; load_conf; monitor_clients "${2:-2}" "${3:-8}" ;;
   log)            require_root; sample_once ;;
   sample)         require_root; sample_once ;;
   report)         require_root; show_report "${2:-30}" ;;

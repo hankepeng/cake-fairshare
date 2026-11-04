@@ -197,7 +197,7 @@ cake-fairshare optimize    # 分析 + 一键应用
 ## 交互菜单
 
 ```
-  CAKE 公平带宽分配 v3.1.0   美国1 · Debian GNU/Linux 12 (bookworm)
+  CAKE 公平带宽分配 v3.1.1   美国1 · Debian GNU/Linux 12 (bookworm)
 ------------------------------------------------------------
   状态：● 运行中      网卡 ens5   下行 168mbit / 上行 180mbit   方向 both
 ------------------------------------------------------------
@@ -232,7 +232,7 @@ cake-fairshare apply            # 按配置启用（无交互，systemd 使用�
 cake-fairshare stop             # 撤销整形，恢复启用前的 qdisc
 cake-fairshare status           # 快照
 cake-fairshare monitor [网卡]   # 实时监控（整机）
-cake-fairshare clients [秒]     # 实时监控（按客户端，默认 2 秒）
+cake-fairshare clients [秒] [行数]  # 实时监控（按客户端，默认 2 秒 / 8 行）
 cake-fairshare log              # 采样一次（供 timer 调用）
 cake-fairshare report [N]       # 查看最近 N 条采样
 cake-fairshare check            # 现场诊断：判断是自身占满还是链路问题
@@ -267,9 +267,12 @@ systemctl enable --now <被停用的服务名>
 菜单第 4 项 → 2，或直接：
 
 ```bash
-cake clients        # 默认 2 秒刷新
-cake clients 1      # 1 秒刷新
+cake clients          # 默认 2 秒刷新
+cake clients 1        # 1 秒刷新
+cake clients 2 6      # 2 秒刷新，表格区固定 6 行
 ```
+
+**表格区固定行数**（默认 8 行），行数不足时补空行，超出则折成一行「另有 N 个客户端在传输」。这样下面的汇总三行永远停在同一位置，不会随着客户端数量增减上下跳。
 
 ```
 客户端实时带宽  ens5   上限 下行 168 / 上行 180 Mbps   Ctrl-C 退出
