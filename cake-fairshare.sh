@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.8.2"
+VERSION="2.9.0"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -449,11 +449,8 @@ show_env() {
   say "  网卡"
   local def ifc mark v6tag
   def=$(primary_iface)
-  i=0
-  for ifc in $ifc_list; do
-    i=$((i + 1))
-    [ "$ifc" = "$def" ] && def_idx=$i
-  done
+  # 注意：这里不要引用 ifc_list —— 那是 menu_enable 的局部变量，
+  # 在 set -u 下自检会直接中断（v2.9.0 前的隐藏 bug：自检只显示到"网卡"就停）
   for ifc in $(list_ifaces); do
     mark=""
     [ "$ifc" = "$def" ] && mark=" ${G}<- 默认路由${R}"
@@ -461,6 +458,25 @@ show_env() {
     if iface_has_v6 "$ifc"; then v6tag=" ${C}[+IPv6]${R}"; fi
     printf '    %-12s qdisc=%-8s %s%s%s\n' "$ifc" "$(root_qdisc "$ifc")" \
       "$(ip -4 -br addr show dev "$ifc" 2>/dev/null | awk '{print $3}' | head -n1)" "$v6tag" "$mark"
+  done
+
+  # 只有私网地址 = 云厂商 EIP/NAT 场景：带宽限制作用在出方向
+  local a4
+  a4=$(ip -4 -br addr show dev "$def" 2>/dev/null | awk '{print $3}' | head -n1)
+  case "$a4" in
+    10.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | 192.168.*)
+      dim "  公网出口  : $def 只有私网地址（EIP/NAT），云厂商的带宽限制作用在出方向"
+      dim "              所以 RATE_EGRESS 才是用户下载的实际上限，RATE_INGRESS 可略高"
+      ;;
+  esac
+
+  # 入口 ifb 队列过短会在微突发时直接丢包（旧版本默认 32，实测丢 1.4%）
+  local dev q
+  for dev in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^ifb[0-9]+$/ {print $2}'); do
+    q=$(cat "/sys/class/net/$dev/tx_queue_len" 2>/dev/null)
+    if [ -n "$q" ] && [ "$q" -lt 1000 ]; then
+      printf '  %b!%b %s 队列长度仅 %s 个包，入口容易丢包；重新 apply 会自动改为 1000\n' "$Y" "$R" "$dev" "$q"
+    fi
   done
   hr
   if [ -r "$CONF" ]; then
@@ -496,7 +512,7 @@ show_status() {
     ifb=$(get_state "$ifc" IFB)
     if [ -n "$ifb" ] && ip link show "$ifb" >/dev/null 2>&1; then
       say ""
-      say "${B}$ifb  （入口）${R}"
+      say "${B}$ifb  （入口）${R}  ${D}qlen=$(cat "/sys/class/net/$ifb/tx_queue_len" 2>/dev/null)${R}"
       tc -s qdisc show dev "$ifb" | sed 's/^/    /'
     fi
     say ""
@@ -711,19 +727,52 @@ EOF
   systemctl enable --now cake-fairshare >/dev/null 2>&1
 }
 
+detect_existing_rate() {
+  # 读出机器上"已经在用"的整形速率，输出 "出口 入口"（取不到就留空）。
+  # 用途：init 时如果用户没指定带宽，沿用它而不是套默认值——
+  # 否则在一台已经限速 168/180 的机器上直接套 190，会改变现有速度。
+  local ifc="$1" eg="" in="" d ifb=""
+  eg=$(tc -s class show dev "$ifc" 2>/dev/null \
+    | awk '/^class /{for (i = 1; i <= NF; i++) if ($i == "rate") {print $(i+1); exit}}')
+  for d in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^ifb[0-9]+$/ {print $2}'); do
+    ifb="$d"
+    break
+  done
+  if [ -n "$ifb" ]; then
+    in=$(tc -s class show dev "$ifb" 2>/dev/null \
+      | awk '/^class /{for (i = 1; i <= NF; i++) if ($i == "rate") {print $(i+1); exit}}')
+  fi
+  # 根队列已经是 cake 时上面取不到，退一步解析常见的一键限速脚本
+  if [ -z "$eg" ] && [ -r /root/bandwidth-limit.sh ]; then
+    eg=$(sed -n 's/^UP_MBPS="\([0-9][0-9]*\)".*/\1mbit/p' /root/bandwidth-limit.sh | head -n1)
+    [ -z "$in" ] && in=$(sed -n 's/^DOWN_MBPS="\([0-9][0-9]*\)".*/\1mbit/p' /root/bandwidth-limit.sh | head -n1)
+  fi
+  printf '%s %s\n' "$eg" "$in"
+}
+
 do_init() {
-  local rate="" ifc a clean=0
+  local rate="" ifc a clean=0 explicit=0 d_eg="" d_in=""
   for a in "$@"; do
     case "$a" in
       --clean) clean=1 ;;
       "" ) ;;
-      *) rate="$a" ;;
+      *) rate="$a"; explicit=1 ;;
     esac
   done
-  rate=$(normalize_rate "${rate:-$DEF_RATE}") || die "带宽格式无法识别：${rate:-}"
   ifc=$(primary_iface)
   [ -n "$ifc" ] || die "找不到默认路由网卡，请手动用菜单第 2 项配置"
   require_root
+
+  # 没显式给带宽时，先看机器上本来就限速多少，沿用而不是覆盖
+  if [ "$explicit" -eq 0 ]; then
+    read -r d_eg d_in <<<"$(detect_existing_rate "$ifc")"
+    if [ -n "$d_eg" ]; then
+      rate=$(normalize_rate "$d_eg") || rate=""
+    fi
+  fi
+  if [ -z "$rate" ]; then
+    rate=$(normalize_rate "$DEF_RATE") || die "带宽格式无法识别：$DEF_RATE"
+  fi
 
   if [ -r "$CONF" ]; then
     cp "$CONF" "${CONF}.bak.$(date +%Y%m%d%H%M%S)"
@@ -732,6 +781,14 @@ do_init() {
   IFACES="$ifc"; RATE="$rate"; MODE="both"
   RATE_EGRESS=""; RATE_INGRESS=""
   CAKE_OPTS=""; CAKE_OPTS_INGRESS="$DEF_CAKE_OPTS_INGRESS"
+  if [ "$explicit" -eq 0 ] && [ -n "$d_eg" ]; then
+    RATE_EGRESS=$(normalize_rate "$d_eg" 2>/dev/null) || RATE_EGRESS=""
+    if [ -n "$d_in" ]; then
+      RATE_INGRESS=$(normalize_rate "$d_in" 2>/dev/null) || RATE_INGRESS=""
+    fi
+    ok "沿用机器上现有的整形速率：出口 ${RATE_EGRESS:-$RATE} / 入口 ${RATE_INGRESS:-$RATE}"
+    dim "  想改就显式指定：cake-fairshare init 190mbit（或菜单第 7 / 9 项）"
+  fi
   save_conf
   ok "配置：网卡 $IFACES  带宽 $RATE  方向 both  入口参数 ${CAKE_OPTS_INGRESS:-无}"
 
@@ -930,14 +987,19 @@ sample_once() {
   [ "$dt" -gt 0 ] || return 0
   [ "$rx" -ge "${lrx:-0}" ] || return 0
 
-  local rx_m tx_m eo ed io cn
+  local rx_m tx_m eo ed io cn eb ib
   rx_m=$(awk -v a="$lrx" -v b="$rx" -v t="$dt" 'BEGIN{printf "%.2f",(b-a)*8/t/1000000}')
   tx_m=$(awk -v a="$ltx" -v b="$tx" -v t="$dt" 'BEGIN{printf "%.2f",(b-a)*8/t/1000000}')
   eo=$(qdisc_stat "$ifc" overlimits)
   ed=$(qdisc_stat "$ifc" dropped)
+  # backlog 才是判断"速率设得对不对"的指标：长期 0 = 从未把队列填满
+  eb=$(qdisc_stat "$ifc" backlog)
   ifb=$(get_state "$ifc" IFB)
-  io=""
-  [ -n "$ifb" ] && io=$(qdisc_stat "$ifb" overlimits)
+  io=""; ib=""
+  if [ -n "$ifb" ]; then
+    io=$(qdisc_stat "$ifb" overlimits)
+    ib=$(qdisc_stat "$ifb" backlog)
+  fi
   cn=$(ss -Htn state established 2>/dev/null | wc -l | tr -d ' ')
 
   # 记录连接数最多的 3 个客户端 IP（用于区分"多设备"与"多人共用出口"）
@@ -959,9 +1021,10 @@ sample_once() {
     fi
   fi
 
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date '+%F %T')" "$rx_m" "$tx_m" \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date '+%F %T')" "$rx_m" "$tx_m" \
     "${eo:-0}" "${ed:-0}" "${io:-0}" "${cn:-0}" \
-    "${a1:-}" "${c1:-0}" "${a2:-}" "${c2:-0}" "${a3:-}" "${c3:-0}" >>"$SAMPLE_LOG"
+    "${a1:-}" "${c1:-0}" "${a2:-}" "${c2:-0}" "${a3:-}" "${c3:-0}" \
+    "${eb:-0}" "${ib:-0}" >>"$SAMPLE_LOG"
   trim_log
 }
 
@@ -1111,6 +1174,9 @@ health_report() {
       if ($8 != "" && $9 + 0 > pmax[$8]) pmax[$8] = $9 + 0
       if ($10 != "" && $11 + 0 > pmax[$10]) pmax[$10] = $11 + 0
       if ($12 != "" && $13 + 0 > pmax[$12]) pmax[$12] = $13 + 0
+      # 14/15 列是出口/入口 backlog（旧版日志没有这两列，按 0 处理）
+      if ($14 + 0 > mebk) mebk = $14 + 0
+      if ($15 + 0 > mibk) mibk = $15 + 0
       first = (first == "" ? ts : first)
       last = ts
     }
@@ -1118,16 +1184,24 @@ health_report() {
       printf "  %-13s %6s %8s %10s %10s %10s\n", "时段", "样本", "连接峰值", "下行峰值", "下行均值", "上行均值"
       for (i = 1; i <= h; i++) {
         k = order[i]
-        flag = ""
-        if (cnt[k] >= 5 && mc[k] >= 3 && mx[k] < ce * 0.2)
-          flag = sprintf("  <- %d 个连接但峰值仅 %.1f Mbps，疑似外部限制", mc[k], mx[k])
-        printf "  %-13s %6d %8d %10.1f %10.1f %10.1f%s\n", substr(k,6) ":00", cnt[k], mc[k], mx[k], st[k]/cnt[k], sr[k]/cnt[k], flag
+        # 不在这里判"是否被外部限速"：连接数含出站到目标站的连接，
+        # 空闲时连接很多但流量很低是常态，据此判定必然误报（实测 307 连接 / 26 Mbps 被误标）。
+        printf "  %-13s %6d %8d %10.1f %10.1f %10.1f\n", substr(k,6) ":00", cnt[k], mc[k], mx[k], st[k]/cnt[k], sr[k]/cnt[k]
       }
       printf "\n  记录区间：%s  ~  %s\n", first, last
       printf "  下行峰值：%.1f Mbps（%s）\n", gmax, gmax_t
       printf "  上行峰值：%.1f Mbps\n", gramax
+      if (ce > 0) printf "  出口峰值占用：%.0f%%（%.1f / %.1f Mbps）\n", gmax * 100 / ce, gmax, ce
       if (gmax > ce * 1.05) printf "  %s\n", "注：峰值高于整形上限，说明该时段整形被临时关闭过（例如手动测速）"
-      else if (gmax < ce * 0.5) printf "  %s\n", "提示：峰值不到上限一半，可能是用户少，或上游本身跑不满"
+
+      printf "  队列最大积压：出口 %d 字节 / 入口 %d 字节\n", mebk, mibk
+      if (mebk <= 0 && mibk <= 0)
+        printf "  %s\n", "→ 队列从未被填满：上限比实际需求宽，不会成为瓶颈（也就没有提速空间被浪费）"
+      else if (mebk > 0 || mibk > 0)
+        printf "  %s\n", "→ 出现过排队：上限确实在起作用，公平分配已生效"
+
+      if (gmax < ce * 0.5 && mebk <= 0)
+        printf "  %s\n", "提示：峰值不到上限一半且从不排队，说明这台机器当前用不满这个带宽"
 
       np = 0
       for (ip in pmax) { np++; pl[np] = ip }
@@ -1154,14 +1228,14 @@ health_report() {
   say ""
   hr
   if [ "${ST_ALERTS:-0}" -eq 0 ]; then
-    ok "历史测速未发现异常，也没有「有连接但跑不动」的时段"
+    ok "历史测速未发现异常，带宽表现正常"
   else
     note "历史测速中有 ${ST_ALERTS} 次明显偏低（已用黄色标出），其余时间正常"
     dim "  短暂一两次通常是上游抖动或当时本机流量占满；频繁出现才需要考虑换线路或找服务商"
   fi
-  dim "  说明：采样是「实际用量」不是「能力测试」。用量低不等于被限速，"
-  dim "        只有「有多个连接、却始终跑不过上限 20%」才值得怀疑。"
-  dim "        历史测速记录才是直接证据，偏低的那几条已经标出来了。"
+  dim "  说明：采样是「实际用量」，空闲时速度当然是 0，用量低不等于被限速。"
+  dim "        采样也看不出上游是否在限速——被云网关丢掉的包，系统里根本看不到。"
+  dim "        判断有没有被限速只能靠「历史测速记录」，偏低的那几条已经标出来了。"
 }
 
 install_daily_timer() {
