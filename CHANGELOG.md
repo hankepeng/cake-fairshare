@@ -1,5 +1,21 @@
 # Changelog
 
+## v3.6.4 — 2026-11-04
+
+### 修复
+
+- **官方软件源添加失败后直接放弃**。部分机器（精简系统、网络受限、缺 `ca-certificates`）跑 `install.deb.sh` 会失败，v3.6.2 只打印"官方软件源添加失败"就结束。现在改为两条路线：先试发行版仓库，失败自动改用 **Ookla 官方静态二进制**（`ookla-speedtest-1.2.0-linux-{x86_64,aarch64,armhf,i386}.tgz`，装到 `/usr/local/bin/speedtest`）。这条路线不依赖 apt/dnf 仓库与系统库，Alpine 也能直接用；在 apk 系统会先补 `wget ca-certificates tar`。
+- 包管理器路线装不上 `speedtest` 时仍保留 Debian 自带 `speedtest-cli` 的回退。
+
+### 回归验证
+
+| 测试 | 结果 |
+|---|---|
+| 强制 apt 失败 → 二进制兜底（真机下载） | 成功装到 `/usr/local/bin/speedtest`，`--version` 正常（Ookla 1.2.0，musl 静态） |
+| 四种架构 URL | x86_64 / aarch64 / armhf / i386 均返回 200 |
+| 二进制下载失败 / 缺 tar / 无下载工具 | 分别给出明确原因并返回 1 |
+| `bash -n` + `shellcheck` | 0 告警 |
+
 ## v3.6.3 — 2026-11-04
 
 ### 修复

@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.3"
+VERSION="3.6.4"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -1639,10 +1639,95 @@ speedtest_bin() {
   command -v speedtest 2>/dev/null || command -v speedtest-cli 2>/dev/null
 }
 
+speedtest_arch() {
+  case "$(uname -m)" in
+    x86_64 | amd64) printf 'x86_64\n' ;;
+    aarch64 | arm64) printf 'aarch64\n' ;;
+    armv7l | armv6l) printf 'armhf\n' ;;
+    i386 | i686) printf 'i386\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+fetch_file() {
+  # $1=URL $2=目标文件；curl 失败时再用 wget 兜一次
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 10 --max-time 180 "$1" -o "$2" && return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO "$2" --timeout=180 "$1" && return 0
+  fi
+  return 1
+}
+
+install_speedtest_bin() {
+  # 官方静态二进制兜底：不依赖发行版仓库，Alpine 等精简系统也能用
+  local ver="1.2.0" arch url tmpd
+  arch=$(speedtest_arch) || {
+    note "CPU 架构 $(uname -m) 没有官方二进制包，无法自动安装"
+    logline "SPEEDTEST install fail arch=$(uname -m)"
+    return 1
+  }
+
+  # Alpine 默认可能缺 wget 与证书；补齐依赖，失败也不阻塞后续判断
+  if command -v apk >/dev/null 2>&1; then
+    apk add --no-cache wget ca-certificates tar >/dev/null 2>&1 || true
+  fi
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y wget ca-certificates >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y wget ca-certificates >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y wget ca-certificates >/dev/null 2>&1 || true
+    fi
+  fi
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    bad "缺少 curl/wget，无法下载二进制"
+    logline "SPEEDTEST install fail no-downloader"
+    return 1
+  fi
+  if ! command -v tar >/dev/null 2>&1; then
+    bad "缺少 tar，无法解压二进制包"
+    logline "SPEEDTEST install fail no-tar"
+    return 1
+  fi
+
+  tmpd=$(mktemp -d) || { bad "创建临时目录失败"; return 1; }
+  url="https://install.speedtest.net/app/cli/ookla-speedtest-${ver}-linux-${arch}.tgz"
+  say "  下载官方二进制（${arch}）：$url"
+  if ! fetch_file "$url" "$tmpd/pkg.tgz" 2>/dev/null || [ ! -s "$tmpd/pkg.tgz" ]; then
+    rm -rf "$tmpd"
+    bad "二进制下载失败（检查网络/代理）"
+    logline "SPEEDTEST install fail bin-download arch=$arch"
+    return 1
+  fi
+  if ! tar -xzf "$tmpd/pkg.tgz" -C "$tmpd" 2>/dev/null || [ ! -f "$tmpd/speedtest" ]; then
+    rm -rf "$tmpd"
+    bad "二进制包解压失败"
+    logline "SPEEDTEST install fail bin-extract arch=$arch"
+    return 1
+  fi
+
+  mkdir -p /usr/local/bin
+  if ! cp "$tmpd/speedtest" /usr/local/bin/speedtest || ! chmod 0755 /usr/local/bin/speedtest; then
+    rm -rf "$tmpd"
+    bad "无法写入 /usr/local/bin/speedtest"
+    logline "SPEEDTEST install fail bin-copy arch=$arch"
+    return 1
+  fi
+  rm -rf "$tmpd"
+
+  [ -x /usr/local/bin/speedtest ] || return 1
+  SPEEDTEST_BIN_PATH="/usr/local/bin/speedtest"
+  return 0
+}
+
 ensure_speedtest() {
   # 缺失时自动安装测速 CLI，结果放进 SPEEDTEST_BIN_PATH。
   # 交互、定时器（无 tty）都走这里，不让用户自己去装。
-  local url="" pm="" installed=0
+  # 路线：发行版仓库 → 官方静态二进制兜底。
+  local url="" pm="" installed=0 tmp=""
   SPEEDTEST_BIN_PATH=$(speedtest_bin)
   [ -n "$SPEEDTEST_BIN_PATH" ] && return 0
 
@@ -1659,49 +1744,27 @@ ensure_speedtest() {
   elif command -v yum >/dev/null 2>&1; then
     pm=yum
     url="https://install.speedtest.net/app/cli/install.rpm.sh"
-  else
-    bad "无法识别系统的包管理器，自动安装失败"
-    dim "  手动安装：https://www.speedtest.net/apps/cli"
-    logline "SPEEDTEST install fail no-pkg-manager"
-    return 1
   fi
 
-  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    bad "缺少 curl/wget，无法下载安装脚本"
-    dim "  先安装：apt install -y curl   或   dnf install -y curl"
-    logline "SPEEDTEST install fail no-downloader"
-    return 1
+  if [ -n "$pm" ]; then
+    say "  尝试官方软件源安装..."
+    tmp=$(mktemp) || tmp=""
+    if [ -n "$tmp" ] && fetch_file "$url" "$tmp" 2>/dev/null && bash "$tmp" >/dev/null 2>&1; then
+      case "$pm" in
+        apt)
+          apt-get update -qq >/dev/null 2>&1 || true
+          DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest >/dev/null 2>&1 && installed=1
+          # 官方源不可用时退回 Debian 自带的 speedtest-cli（输出格式兼容）
+          [ "$installed" -eq 1 ] || { DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest-cli >/dev/null 2>&1 && installed=1; }
+          ;;
+        dnf) dnf install -y speedtest >/dev/null 2>&1 && installed=1 ;;
+        yum) yum install -y speedtest >/dev/null 2>&1 && installed=1 ;;
+      esac
+    else
+      note "官方软件源不可用，改用官方二进制安装"
+    fi
+    [ -n "$tmp" ] && rm -f "$tmp"
   fi
-
-  local tmp
-  tmp=$(mktemp) || return 1
-  say "  下载官方安装脚本：$url"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$tmp" 2>/dev/null || { rm -f "$tmp"; bad "下载安装脚本失败（检查网络/代理）"; logline "SPEEDTEST install fail download"; return 1; }
-  else
-    wget -qO "$tmp" "$url" 2>/dev/null || { rm -f "$tmp"; bad "下载安装脚本失败（检查网络/代理）"; logline "SPEEDTEST install fail download"; return 1; }
-  fi
-
-  say "  添加官方软件源..."
-  if ! bash "$tmp" >/dev/null 2>&1; then
-    rm -f "$tmp"
-    bad "官方软件源添加失败"
-    logline "SPEEDTEST install fail repo pm=$pm"
-    return 1
-  fi
-  rm -f "$tmp"
-
-  say "  安装 speedtest（首次约 30~60 秒）..."
-  case "$pm" in
-    apt)
-      apt-get update -qq >/dev/null 2>&1 || true
-      DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest >/dev/null 2>&1 && installed=1
-      # 官方源不可用时退回 Debian 自带的 speedtest-cli（输出格式兼容）
-      [ "$installed" -eq 1 ] || { DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest-cli >/dev/null 2>&1 && installed=1; }
-      ;;
-    dnf) dnf install -y speedtest >/dev/null 2>&1 && installed=1 ;;
-    yum) yum install -y speedtest >/dev/null 2>&1 && installed=1 ;;
-  esac
 
   SPEEDTEST_BIN_PATH=$(speedtest_bin)
   if [ -n "$SPEEDTEST_BIN_PATH" ]; then
@@ -1710,9 +1773,16 @@ ensure_speedtest() {
     return 0
   fi
 
+  say "  改用官方二进制安装（不依赖系统仓库）..."
+  if install_speedtest_bin; then
+    ok "已自动安装：$SPEEDTEST_BIN_PATH"
+    logline "SPEEDTEST install ok path=$SPEEDTEST_BIN_PATH"
+    return 0
+  fi
+
   bad "自动安装失败"
-  dim "  可手动安装：curl -s $url | bash && apt install -y speedtest"
-  logline "SPEEDTEST install fail pkg pm=$pm"
+  dim "  可手动安装： curl -fsSL https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | tar xz && mv speedtest /usr/local/bin/"
+  logline "SPEEDTEST install fail"
   return 1
 }
 
