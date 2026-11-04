@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.2.1"
+VERSION="3.2.2"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -597,7 +597,7 @@ QD_AWK='
 monitor_clients() {
   require_root
   load_conf
-  local ifc interval="${1:-2}" rows="${2:-10}" cap_e cap_i f1 f2 t1 t2 stop=0 eb ib ifb lports
+  local ifc interval="${1:-2}" rows="${2:-10}" cap_e cap_i f1 f2 f3 t1 t2 stop=0 eb ib ifb lports ln l2
   ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
   [ -n "$ifc" ] || ifc=$(primary_iface)
   [ -n "$ifc" ] || { note "没有可用网卡"; return 1; }
@@ -611,12 +611,16 @@ monitor_clients() {
 
   f1=$(mktemp) || return 1
   f2=$(mktemp) || { rm -f "$f1"; return 1; }
+  f3=$(mktemp) || { rm -f "$f1" "$f2"; return 1; }
   # 监听端口在一次观察期间不会变，算一次就够
   local lports
   lports=$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed -E 's/.*://' | grep -vx '22' | sort -u | tr '\n' ',')
   [ -n "$lports" ] || { note "没找到正在监听的代理端口（XrayR 没跑？）"; rm -f "$f1" "$f2"; return 1; }
   ifb=$(get_state "$ifc" IFB)
   trap 'stop=1' INT
+  # 只在一开始清一次屏。之后每帧把光标移回左上角就地覆盖，
+  # 不要再 clear —— 先清空再重画会让整屏闪一下，看起来一闪一闪的。
+  if [ -t 1 ]; then clear; fi
   while [ "$stop" -eq 0 ]; do
     # EPOCHREALTIME 是 bash 内建，比 date 少 fork 两次
     if [ -n "${EPOCHREALTIME:-}" ]; then t1=${EPOCHREALTIME/./}; else t1=$(date +%s%6N); fi
@@ -624,7 +628,7 @@ monitor_clients() {
     sleep "$interval"
     if [ -n "${EPOCHREALTIME:-}" ]; then t2=${EPOCHREALTIME/./}; else t2=$(date +%s%6N); fi
     client_snapshot "$lports" >"$f2"
-    if [ -t 1 ]; then clear; fi
+    {
     say "${B}客户端实时带宽${R}  ${D}$ifc   上限 下行 ${cap_e} / 上行 ${cap_i} Mbps   Ctrl-C 退出${R}"
     hr
     # 表头用 shell 手写而不是 awk 的 %-20s：printf 按字节补齐，
@@ -714,9 +718,20 @@ monitor_clients() {
     # 里面的 $(i + 1) 和 $0 会被 bash 当成本机的命令替换／变量先展开掉。
     read -r eb ib <<<"$(tc -s qdisc show 2>/dev/null | awk -v a="$ifc" -v b="$ifb" "$QD_AWK")"
     dim "  出口队列积压 ${eb:-0} B   入口积压 ${ib:-0} B   （长期为 0 = 没到上限）"
+    } >"$f3"
+    # 就地覆盖。整帧先拼成一个字符串再一次性写出：
+    # 逐行 printf 在 SSH 上会分成多次写，容易出现半帧撕裂的观感。
+    # 每行尾部加 ESC[K，数字变短时不会留下上一帧的残字。
+    if [ -t 1 ]; then
+      ln=''
+      while IFS= read -r l2; do ln+="$l2"$'\033[K\n'; done <"$f3"
+      printf '\033[H%s' "$ln"
+    else
+      cat "$f3"
+    fi
   done
   trap - INT
-  rm -f "$f1" "$f2"
+  rm -f "$f1" "$f2" "$f3"
   say ""
 }
 
@@ -727,6 +742,7 @@ monitor() {
   [ -n "$ifc" ] || { note "没有可用网卡"; return 1; }
   local rx1 tx1 rx2 tx2 t1 t2 dt stop=0
   trap 'stop=1' INT
+  if [ -t 1 ]; then clear; fi
   while [ "$stop" -eq 0 ]; do
     t1=$(date +%s%N)
     read -r rx1 tx1 < <(awk -v d="$ifc" '$1==d":" {print $2, $10}' /proc/net/dev)
@@ -734,7 +750,7 @@ monitor() {
     t2=$(date +%s%N)
     read -r rx2 tx2 < <(awk -v d="$ifc" '$1==d":" {print $2, $10}' /proc/net/dev)
     dt=$(awk -v a="$t1" -v b="$t2" 'BEGIN{print (b-a)/1000000000}')
-    if [ -t 1 ]; then clear; fi
+    if [ -t 1 ]; then printf '\033[H'; fi
     say "${B}实时监控  $ifc${R}   ${D}(Ctrl-C 退出)${R}"
     hr
     awk -v a="$rx1" -v b="$rx2" -v c="$tx1" -v d="$tx2" -v t="$dt" 'BEGIN{
@@ -743,6 +759,8 @@ monitor() {
     }'
     hr
     tc -s qdisc show dev "$ifc" | sed 's/^/  /'
+    # 这一块行数可能变少，擦掉残留
+    if [ -t 1 ]; then printf '\033[J'; fi
   done
   trap - INT
   say ""
