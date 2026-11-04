@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.2.0"
+VERSION="3.2.1"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -685,7 +685,7 @@ monitor_clients() {
               pct = (sh > 0) ? (DN[ip] + UP[ip]) * 100 / sh : 0
               printf "  %-20s %4d %10.2f %10.2f %10.2f %5.0f%%\n", ip, CN[ip], DN[ip], UP[ip], DN[ip] + UP[ip], pct
             } else {
-              printf "  %-20s %4d %10s %10s %10s  空载无流量\n", ip, CN[ip], "-", "-", "-"
+              printf "  %-20s %4d %10s %10s %10s  空载\n", ip, CN[ip], "-", "-", "-"
             }
           }
           used = show
