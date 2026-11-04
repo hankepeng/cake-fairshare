@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.2.2"
+VERSION="3.3.0"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -34,6 +34,8 @@ SAMPLE_STATE="/var/lib/cake-fairshare/last"
 LOG_UNIT="/etc/systemd/system/cake-fairshare-log.service"
 DAILY_LOG="/var/log/cake-fairshare-daily.log"
 REPORT_UNIT="/etc/systemd/system/cake-fairshare-report.service"
+SPEEDTEST_UNIT="/etc/systemd/system/cake-fairshare-speedtest.service"
+SPEEDTEST_DIR_DEF="/root/speedtest_history"
 
 if [ -t 1 ]; then
   R=$'\033[0m'; B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; RD=$'\033[31m'; C=$'\033[36m'; D=$'\033[2m'
@@ -124,6 +126,7 @@ load_conf() {
   IFACES=""; RATE="$DEF_RATE"; MODE="both"
   RATE_EGRESS=""; RATE_INGRESS=""
   CAKE_OPTS=""; CAKE_OPTS_INGRESS="$DEF_CAKE_OPTS_INGRESS"
+  AUTO_TEST_IDLE_PCT="15"; AUTO_TEST_MAXWAIT="900"
   # shellcheck disable=SC1090
   if [ -r "$CONF" ]; then . "$CONF"; fi
 }
@@ -149,6 +152,9 @@ save_conf() {
     printf 'RATE_INGRESS="%s"\n' "${RATE_INGRESS:-}"
     printf 'CAKE_OPTS="%s"\n' "${CAKE_OPTS:-}"
     printf 'CAKE_OPTS_INGRESS="%s"\n' "${CAKE_OPTS_INGRESS:-}"
+    printf '# 自动测速：空闲阈值（占上限百分比）与最长等待秒数\n'
+    printf 'AUTO_TEST_IDLE_PCT="%s"\n' "${AUTO_TEST_IDLE_PCT:-15}"
+    printf 'AUTO_TEST_MAXWAIT="%s"\n' "${AUTO_TEST_MAXWAIT:-900}"
   } >"$CONF"
 }
 
@@ -1389,12 +1395,16 @@ diagnose() {
 show_speedtest_history() {
   local dir="${SPEEDTEST_DIR:-/root/speedtest_history}"
   [ -d "$dir" ] || return 0
-  local files f ts dl ul maxdl
+  local files f ts dl ul maxdl base_files
   files=$(ls -1t "$dir"/* 2>/dev/null | head -12 | sort)
   [ -n "$files" ] || return 0
+  # 基准用最近 60 条来算，只显示最近 12 条。
+  # 否则每小时自动测速后，一旦连续掉速十几次，显示的那 12 条全是低值，
+  # 基准会被算成低值，反而把"异常"判成"正常"。
+  base_files=$(ls -1t "$dir"/* 2>/dev/null | head -60)
 
   local maxdl=0 maxul=0
-  for f in $files; do
+  for f in $base_files; do
     dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
     ul=$(grep -m1 'Upload:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
     [ -n "$dl" ] || continue
@@ -1583,6 +1593,112 @@ show_daily() {
   tail -n 120 "$DAILY_LOG" | sed 's/^/  /'
 }
 
+speedtest_bin() {
+  command -v speedtest 2>/dev/null || command -v speedtest-cli 2>/dev/null
+}
+
+iface_rate_mbps() {
+  # 3 秒采样，输出 "入向Mbps 出向Mbps"
+  local ifc="$1" a b
+  a=$(awk -v d="$ifc" '$1==d":" {print $2, $10}' /proc/net/dev)
+  sleep 3
+  b=$(awk -v d="$ifc" '$1==d":" {print $2, $10}' /proc/net/dev)
+  awk -v a="$a" -v b="$b" 'BEGIN{
+    split(a, x, " "); split(b, y, " ")
+    printf "%.2f %.2f\n", (y[1] - x[1]) * 8 / 3e6, (y[2] - x[2]) * 8 / 3e6
+  }'
+}
+
+record_speedtest() {
+  # 跑一次测速并写入历史目录（供「带宽健康报告」读取）。
+  # $1 = auto 时先等链路空闲，避免在晚高峰跟用户抢带宽。
+  load_conf
+  require_root
+  local bin mode="${1:-now}" ifc dir ts f out dl ul waited=0 pct maxwait mb_in mb_out cap_e cap_i d
+  bin=$(speedtest_bin)
+  if [ -z "$bin" ]; then
+    bad "没有 speedtest 命令"
+    dim "  Debian/Ubuntu 安装： curl -s https://install.speedtest.net/app/cli/install.deb.sh | bash && apt install -y speedtest"
+    return 1
+  fi
+  ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
+  [ -n "$ifc" ] || ifc=$(primary_iface)
+  dir="${SPEEDTEST_DIR:-$SPEEDTEST_DIR_DEF}"
+  mkdir -p "$dir" 2>/dev/null
+
+  if [ "$mode" = "auto" ]; then
+    pct="${AUTO_TEST_IDLE_PCT:-15}"
+    maxwait="${AUTO_TEST_MAXWAIT:-900}"
+    cap_e=$(unit_num "${RATE_EGRESS:-$RATE}")
+    cap_i=$(unit_num "${RATE_INGRESS:-$RATE}")
+    say "  等待链路空闲：出/入都低于上限的 ${pct}% 才开测，最多等 $((maxwait / 60)) 分钟"
+    while :; do
+      read -r mb_in mb_out <<<"$(iface_rate_mbps "$ifc")"
+      if awk -v a="$mb_out" -v b="$mb_in" -v ce="$cap_e" -v ci="$cap_i" -v p="$pct" \
+        'BEGIN{exit !(a < ce * p / 100 && b < ci * p / 100)}'; then
+        break
+      fi
+      if [ "$waited" -ge "$maxwait" ]; then
+        logline "SPEEDTEST skip busy out=${mb_out}M in=${mb_in}M waited=${waited}s"
+        note "链路一直不空闲（出 ${mb_out} / 入 ${mb_in} Mbps），本次跳过，不打扰用户"
+        return 0
+      fi
+      sleep 30
+      waited=$((waited + 30))
+    done
+    say "  链路空闲（出 ${mb_out} / 入 ${mb_in} Mbps），开始测速"
+  fi
+
+  say "  正在测速，约 15~30 秒，期间会短暂占用带宽..."
+  if ! out=$("$bin" 2>&1); then
+    logline "SPEEDTEST fail"
+    bad "测速失败"
+    printf '%s\n' "$out" | head -3 | sed 's/^/    /'
+    return 1
+  fi
+
+  ts=$(date '+%Y%m%d_%H%M%S')
+  f="$dir/speedtest_${ts}.txt"
+  { date '+%Y/%m/%d %H:%M'; printf '%s\n' "$out"; } >"$f"
+  # 只留最近 240 条（每小时一条约 10 天）
+  ls -1t "$dir"/speedtest_* 2>/dev/null | tail -n +241 | while read -r d; do rm -f "$d"; done
+
+  dl=$(printf '%s' "$out" | grep -m1 'Download:' | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  ul=$(printf '%s' "$out" | grep -m1 'Upload:' | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  logline "SPEEDTEST ok dl=${dl:-?} ul=${ul:-?} file=$f"
+  ok "已记录：下行 ${dl:-?} / 上行 ${ul:-?} Mbps"
+  dim "  文件：$f"
+}
+
+install_speedtest_timer() {
+  cat >"$SPEEDTEST_UNIT" <<'EOF'
+[Unit]
+Description=CAKE speedtest (waits for an idle link before running)
+After=cake-fairshare.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cake-fairshare speedtest --auto
+TimeoutStartSec=1800
+EOF
+  cat >"${SPEEDTEST_UNIT%.service}.timer" <<'EOF'
+[Unit]
+Description=Hourly speedtest at the top of the hour
+
+[Timer]
+OnCalendar=*-*-* *:00:00
+AccuracySec=30s
+Persistent=false
+Unit=cake-fairshare-speedtest.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now cake-fairshare-speedtest.timer >/dev/null 2>&1
+}
+
 install_log_timer() {
   cat >"$LOG_UNIT" <<'EOF'
 [Unit]
@@ -1614,6 +1730,7 @@ menu_log() {
   local act n
   say ""
   say "  采样日志：每分钟记录一次上行/下行实速与队列统计，用于事后判断是否被平台限速"
+  say "  自动测速：每小时整点检查链路是否空闲，空闲才跑，结果进「带宽健康报告」"
   hr
   say "  1) 开启每分钟采样"
   say "  2) 关闭采样"
@@ -1623,6 +1740,9 @@ menu_log() {
   say "  6) 开启每天 23:00 自动日报"
   say "  7) 关闭自动日报"
   say "  8) 查看日报"
+  say "  9) 开启每小时自动测速（整点先等链路空闲再测）"
+  say " 10) 关闭自动测速"
+  say " 11) 立即测速一次（马上跑，不等空闲）"
   read -rp "选择 [默认 1]: " act
   case "${act:-1}" in
     1)
@@ -1665,6 +1785,24 @@ menu_log() {
       ;;
     8)
       show_daily
+      ;;
+    9)
+      if install_speedtest_timer; then
+        ok "已开启：每小时整点检查空闲后自动测速"
+        dim "  查看： systemctl list-timers cake-fairshare-speedtest.timer"
+        dim "  若整点链路正忙，最多等 $(( ${AUTO_TEST_MAXWAIT:-900} / 60 )) 分钟后跳过，不会跟用户抢带宽"
+      else
+        bad "开启失败，排查： systemctl status cake-fairshare-speedtest.timer"
+      fi
+      ;;
+    10)
+      systemctl disable --now cake-fairshare-speedtest.timer >/dev/null 2>&1
+      rm -f "${SPEEDTEST_UNIT%.service}.timer" "$SPEEDTEST_UNIT"
+      systemctl daemon-reload
+      ok "已关闭自动测速（历史文件保留）"
+      ;;
+    11)
+      record_speedtest now
       ;;
   esac
   pause
@@ -2018,6 +2156,8 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare check          现场诊断（判断是否自身占满）
   cake-fairshare health         带宽健康报告（限速历史）
   cake-fairshare daily          生成一次日报（供 timer 调用）
+  cake-fairshare speedtest      立即测速一次并记入历史
+  cake-fairshare speedtest --auto   先等链路空闲再测（定时器用这个）
   cake-fairshare name [名称]    设置/查看节点名称
   cake-fairshare optimize       分析机器并一键套用推荐配置（最常用）
   cake-fairshare analyze        只分析、给推荐，不改任何东西
@@ -2047,6 +2187,14 @@ case "${1:-}" in
   check)          require_root; load_conf; diagnose "${2:-}" ;;
   health)         require_root; health_report ;;
   daily)          require_root; load_conf; daily_report ;;
+  speedtest)
+    shift
+    require_root
+    case "${1:-}" in
+      --auto | auto) record_speedtest auto ;;
+      *) record_speedtest now ;;
+    esac
+    ;;
   name)
     shift
     require_root
