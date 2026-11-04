@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.9.0"
+VERSION="2.9.1"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -568,6 +568,9 @@ do_name() {
 
 menu_enable() {
   local ifc_list def sel rate mode confirm chosen n pick ifc i ack def_idx=1
+  local cur="" ovr=0 r_eg="" r_in=""
+  load_conf
+  cur="${RATE:-}"
   ifc_list=$(list_ifaces)
   if [ -z "$ifc_list" ]; then bad "没有可用的物理网卡"; pause; return 1; fi
   def=$(primary_iface)
@@ -610,8 +613,10 @@ menu_enable() {
   fi
   chosen=$(printf '%s' "$chosen" | tr -s ' ' | sed 's/^ //; s/ $//')
 
-  read -rp "总带宽（95/100M/1gbit，按套餐峰值打 95%）[默认 ${DEF_RATE}]: " rate
-  rate=$(normalize_rate "${rate:-$DEF_RATE}") || { bad "带宽格式无法识别"; pause; return 1; }
+  read -rp "总带宽（95/100M/1gbit，按套餐峰值打 95%）[默认 ${cur:-$DEF_RATE}]: " rate
+  rate=$(normalize_rate "${rate:-${cur:-$DEF_RATE}}") || { bad "带宽格式无法识别"; pause; return 1; }
+
+  if [ -n "${RATE_EGRESS:-}" ] || [ -n "${RATE_INGRESS:-}" ]; then ovr=1; fi
 
   say ""
   say "  限制方向："
@@ -629,15 +634,35 @@ menu_enable() {
     esac
   fi
 
+  # 已有单独的上/下行值时，"总带宽"不会生效。必须先问清楚再算预览，
+  # 否则用户改了总带宽却看不到任何变化，而预览还显示成新值，纯误导。
+  if [ "$ovr" -eq 1 ]; then
+    say ""
+    printf '  %b!%b 这台机器在第 9 项单独设置过带宽：出口 %s / 入口 %s\n' \
+      "$Y" "$R" "${RATE_EGRESS:-跟随基准}" "${RATE_INGRESS:-跟随基准}"
+    dim "    单独设置优先，所以本次填的\"总带宽 $rate\"不会生效。"
+    read -rp "  是否清空单独设置，统一用 $rate ？[y/N]: " confirm
+    case "$confirm" in
+      y | Y)
+        RATE_EGRESS=""; RATE_INGRESS=""
+        ok "已清空单独设置，出/入口统一 $rate"
+        ;;
+      *) note "保留单独设置（要单独改就走第 9 项）" ;;
+    esac
+  fi
+
+  r_eg="${RATE_EGRESS:-$rate}"
+  r_in="${RATE_INGRESS:-$rate}"
+
   say ""
   say "${B}即将执行${R}"
   hr
   for ifc in $chosen; do
-    say "  tc qdisc replace dev $ifc root cake bandwidth $rate dual-dsthost"
+    say "  tc qdisc replace dev $ifc root cake bandwidth $r_eg dual-dsthost"
     if [ "$mode" = "both" ]; then
       say "  tc qdisc add dev $ifc handle ffff: ingress"
       say "  tc filter add dev $ifc parent ffff: ... action mirred redirect dev ifbN"
-      say "  tc qdisc replace dev ifbN root cake bandwidth $rate dual-srchost"
+      say "  tc qdisc replace dev ifbN root cake bandwidth $r_in dual-srchost"
     fi
   done
   say ""
@@ -666,24 +691,49 @@ menu_enable() {
 }
 
 menu_rate() {
-  local rate confirm ifc
+  local rate confirm ifc clear_ovr="" r_eg r_in
   load_conf
   if [ -z "$IFACES" ]; then note "尚未配置，请先执行第 2 项"; pause; return 1; fi
+  r_eg="${RATE_EGRESS:-$RATE}"
+  r_in="${RATE_INGRESS:-$RATE}"
+
   say ""
-  say "当前带宽：${B}$RATE${R}    网卡：$IFACES"
+  say "网卡：${B}$IFACES${R}"
+  printf '  基准带宽：%s\n' "$RATE"
   if [ -n "${RATE_EGRESS:-}" ] || [ -n "${RATE_INGRESS:-}" ]; then
-    note "已在第 9 项设置了单独的上/下行带宽，本次只改基准值，不覆盖它们"
+    printf '  实际生效：出口 %s / 入口 %s  %b（第 9 项单独设置，优先于基准值）%b\n' \
+      "$r_eg" "$r_in" "$Y" "$R"
+  else
+    printf '  实际生效：出口 %s / 入口 %s\n' "$r_eg" "$r_in"
   fi
+
   read -rp "新带宽（如 180mbit）: " rate
   if [ -z "$rate" ]; then note "已取消"; pause; return 0; fi
   rate=$(normalize_rate "$rate") || { bad "带宽格式无法识别"; pause; return 1; }
+
+  if [ -n "${RATE_EGRESS:-}" ] || [ -n "${RATE_INGRESS:-}" ]; then
+    note "只改基准值不会生效，因为单独设置优先"
+    read -rp "  是否清空单独设置，让出口和入口都跟随 $rate ？[Y/n]: " clear_ovr
+  fi
+
   read -rp "确认改为 $rate ？[y/N]: " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then note "已取消"; pause; return 0; fi
-  RATE="$rate"; save_conf
+
+  RATE="$rate"
+  case "${clear_ovr:-Y}" in
+    n | N) ;;
+    *) RATE_EGRESS=""; RATE_INGRESS="" ;;
+  esac
+  save_conf
   for ifc in $IFACES; do
     apply_one "$ifc" "$RATE" "$MODE" >/dev/null || bad "$ifc 更新失败"
   done
-  ok "已切换到 $RATE（不中断现有连接，队列参数即时生效）"
+  if [ -z "${RATE_EGRESS:-}" ] && [ -z "${RATE_INGRESS:-}" ]; then
+    ok "已切换到 $RATE（出口与入口都跟随基准值）"
+  else
+    ok "基准值已改为 $RATE，但单独设置仍生效：出口 ${RATE_EGRESS:-$RATE} / 入口 ${RATE_INGRESS:-$RATE}"
+  fi
+  dim "  不中断现有连接，队列参数即时生效"
   pause
 }
 
@@ -897,7 +947,7 @@ menu_advanced() {
   hr
   say "  留空 = 保持不变，输入 - = 清空。参数会原样追加到 cake 命令行。"
   say "  常用： ack-filter（压缩上行纯 ACK）  rtt 70ms  overhead 38  nat  wash"
-  say "  注意：上下行分别限速后，第 7 项改的是基准值，此处会覆盖它。"
+  say "  此处填了值就覆盖基准带宽；填 - 则恢复\"跟随基准值\"。"
   hr
   printf '  出口带宽（当前 %s）: ' "${RATE_EGRESS:-跟随 $RATE}"
   read -rp "" e
