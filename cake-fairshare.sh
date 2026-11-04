@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.1.1"
+VERSION="3.2.0"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -597,14 +597,14 @@ QD_AWK='
 monitor_clients() {
   require_root
   load_conf
-  local ifc interval="${1:-2}" rows="${2:-8}" cap_e cap_i f1 f2 t1 t2 stop=0 eb ib ifb lports
+  local ifc interval="${1:-2}" rows="${2:-10}" cap_e cap_i f1 f2 t1 t2 stop=0 eb ib ifb lports
   ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
   [ -n "$ifc" ] || ifc=$(primary_iface)
   [ -n "$ifc" ] || { note "没有可用网卡"; return 1; }
   case "$interval" in '' | *[!0-9]*) interval=2 ;; esac
   [ "$interval" -ge 1 ] || interval=1
-  case "$rows" in '' | *[!0-9]*) rows=8 ;; esac
-  [ "$rows" -ge 3 ] 2>/dev/null || rows=8
+  case "$rows" in '' | *[!0-9]*) rows=10 ;; esac
+  [ "$rows" -ge 3 ] 2>/dev/null || rows=10
   [ "$rows" -le 40 ] 2>/dev/null || rows=40
   cap_e=$(unit_num "${RATE_EGRESS:-$RATE}")
   cap_i=$(unit_num "${RATE_INGRESS:-$RATE}")
@@ -655,29 +655,42 @@ monitor_clients() {
         }
         sh = (act > 0) ? ce / act : 0
 
-        m = 0
+        # 有流量的排前面（按合计速率降序），没流量的排后面（按连接数降序）
+        a = 0
+        b = 0
         for (i = 1; i <= n; i++) {
           ip = IP[i]
-          if (DN[ip] + UP[ip] < 0.05) continue
-          m++
-          AI[m] = ip
+          if (DN[ip] + UP[ip] >= 0.05) { a++; A[a] = ip }
+          else { b++; B[b] = ip }
         }
+        for (i = 1; i <= b; i++) {
+          bi = i
+          for (j = i + 1; j <= b; j++) if (CN[B[j]] > CN[B[bi]]) bi = j
+          k = B[i]; B[i] = B[bi]; B[bi] = k
+        }
+        r = 0
+        for (i = 1; i <= a; i++) { r++; RIP[r] = A[i]; RACT[r] = 1 }
+        for (i = 1; i <= b; i++) { r++; RIP[r] = B[i]; RACT[r] = 0 }
 
         # 表格固定占 TBL 行。否则客户端数量一变，下面的汇总行就跟着上下跳，
         # 盯着看很晃眼。超出部分折成一行提示。
-        if (m == 0) {
-          printf "  （当前没有在传输数据的客户端）\n"
+        if (r == 0) {
+          printf "  （当前没有任何客户端连接）\n"
           used = 1
         } else {
-          show = (m > TBL) ? TBL - 1 : m
+          show = (r > TBL) ? TBL - 1 : r
           for (i = 1; i <= show; i++) {
-            ip = AI[i]
-            pct = (sh > 0) ? (DN[ip] + UP[ip]) * 100 / sh : 0
-            printf "  %-20s %4d %10.2f %10.2f %10.2f %6.0f%%\n", ip, CN[ip], DN[ip], UP[ip], DN[ip] + UP[ip], pct
+            ip = RIP[i]
+            if (RACT[i]) {
+              pct = (sh > 0) ? (DN[ip] + UP[ip]) * 100 / sh : 0
+              printf "  %-20s %4d %10.2f %10.2f %10.2f %5.0f%%\n", ip, CN[ip], DN[ip], UP[ip], DN[ip] + UP[ip], pct
+            } else {
+              printf "  %-20s %4d %10s %10s %10s  空载无流量\n", ip, CN[ip], "-", "-", "-"
+            }
           }
           used = show
-          if (m > TBL) {
-            printf "  ... 另有 %d 个客户端在传输（已按速率排序，只显示前 %d 个）\n", m - show, show
+          if (r > TBL) {
+            printf "  ... 另有 %d 个客户端未显示（共 %d 个在线，其中 %d 个在传数据）\n", r - show, r, a
             used++
           }
         }
@@ -2009,7 +2022,7 @@ case "${1:-}" in
   stop)           require_root; do_stop ;;
   status)         require_root; show_status ;;
   monitor)        require_root; load_conf; monitor "${2:-}" ;;
-  clients)        require_root; load_conf; monitor_clients "${2:-2}" "${3:-8}" ;;
+  clients)        require_root; load_conf; monitor_clients "${2:-2}" "${3:-10}" ;;
   log)            require_root; sample_once ;;
   sample)         require_root; sample_once ;;
   report)         require_root; show_report "${2:-30}" ;;
