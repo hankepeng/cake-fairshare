@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.8.0"
+VERSION="2.8.1"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -356,6 +356,9 @@ apply_one() {
     while ip link show "ifb$idx" >/dev/null 2>&1; do idx=$((idx + 1)); done
     ifb="ifb$idx"
     if ip link add "$ifb" type ifb 2>/dev/null && ip link set "$ifb" up 2>/dev/null; then
+      # ifb 新建时 txqueuelen 只有 32 个包，入口方向任何微突发都会被直接丢弃
+      # （实测某节点 4 天丢 280 万个包）。放到 1000，让 cake 自己去管排队。
+      ip link set "$ifb" txqueuelen 1000 2>/dev/null
       tc qdisc del dev "$ifc" ingress >/dev/null 2>&1
       tc qdisc add dev "$ifc" handle ffff: ingress 2>/dev/null
       tc filter add dev "$ifc" parent ffff: protocol all u32 \
