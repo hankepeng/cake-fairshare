@@ -1,5 +1,60 @@
 # Changelog
 
+## v3.4.1 — 2026-11-04
+
+### 严重修复：自动测速从未成功过
+
+打开定时器后整点跑的那一次，`speedtest` 直接崩溃：
+
+```
+terminate called after throwing an instance of 'std::logic_error'
+  what():  basic_string::_M_construct null not valid
+```
+
+根因：Ookla CLI 要从 `~/.config/ookla/speedtest-cli.json` 读 license，而 **systemd 服务默认不设置 `HOME`**，取不到路径就抛异常。手动在 shell 里跑有 `HOME`，所以一直没发现。
+
+现在三层兜底：
+
+- service unit 加 `Environment=HOME=%h`
+- 脚本调用时显式传 `HOME="${HOME:-/root}"`，换个调用方式（cron / 手工）也不会崩
+- 补 `--accept-license --accept-gdpr`，避免首次运行卡在确认
+
+实测：修复前 `status=1/FAILURE`，修复后 `/root/speedtest_history/speedtest_20261104_170245.txt` 正常生成（158.35 / 93.82 Mbps），CPU 1.3 秒。
+
+### 改进：整点忙不再白白空等一小时
+
+- 定时器从「每小时整点」改为**每小时 `:00` 和 `:30` 各一次**（`OnCalendar=*-*-* *:00,30:00`，`AccuracySec=10s`）。
+- 等待逻辑照旧：出、入都低于上限 15% 才开测，每次复查间隔 30 秒，最多等 15 分钟，仍忙就放弃本次。
+- 新增 `hour_has_record()`：本小时已有记录就直接跳过。所以 `:00` 成功则 `:30` 自动让路，不会一小时两条；`:00` 忙则 `:30` 再试一次。
+- 等待过程打印进度，不再只有一行开头：
+
+```
+    17:03:08  出 42.80 / 入 18.30 Mbps，仍有负载，30 秒后复查（已等 0 秒 / 上限 900 秒）
+    17:03:41  出 61.20 / 入 25.40 Mbps，仍有负载，30 秒后复查（已等 33 秒 / 上限 900 秒）
+  ! 等了 15 分钟链路一直不空闲（最近一次 出 58.10 / 入 22.70 Mbps），本次跳过，不跟用户抢带宽
+```
+
+- 测速失败自动重试一次。
+- `Nice=10`，测速不跟转发抢 CPU。
+
+### 新增：菜单第 12 项「立即测速并记录」
+
+不用再翻到第 10 项的子菜单，主菜单直接选，马上跑、不等空闲、结果写入历史。
+
+### 新增：可固定测速服务器
+
+```bash
+AUTO_TEST_SERVER_ID=""    # speedtest -L 查 id，填了才能逐小时对比
+```
+
+自动选服务器每次可能换一个，不同服务器测出来的速度差一倍很常见，数据就没法比较。
+
+### 行为边界
+
+- `AUTO_TEST_MAXWAIT` 上限收在 1500 秒，避免和下一轮触发（30 分钟后）撞车
+- 定时器 `Persistent=false`：错过的点不补测
+- 跳过时进程返回 0，unit 不会变成 failed
+
 ## v3.3.0 — 2026-11-04
 
 ### 新增：每小时自动测速

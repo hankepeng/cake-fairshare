@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.3.0"
+VERSION="3.4.1"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -126,7 +126,7 @@ load_conf() {
   IFACES=""; RATE="$DEF_RATE"; MODE="both"
   RATE_EGRESS=""; RATE_INGRESS=""
   CAKE_OPTS=""; CAKE_OPTS_INGRESS="$DEF_CAKE_OPTS_INGRESS"
-  AUTO_TEST_IDLE_PCT="15"; AUTO_TEST_MAXWAIT="900"
+  AUTO_TEST_IDLE_PCT="15"; AUTO_TEST_MAXWAIT="900"; AUTO_TEST_SERVER_ID=""
   # shellcheck disable=SC1090
   if [ -r "$CONF" ]; then . "$CONF"; fi
 }
@@ -155,6 +155,9 @@ save_conf() {
     printf '# 自动测速：空闲阈值（占上限百分比）与最长等待秒数\n'
     printf 'AUTO_TEST_IDLE_PCT="%s"\n' "${AUTO_TEST_IDLE_PCT:-15}"
     printf 'AUTO_TEST_MAXWAIT="%s"\n' "${AUTO_TEST_MAXWAIT:-900}"
+    printf '# 固定测速服务器 id（speedtest -L 查看）；留空则每次自动选最近的，\n'
+    printf '# 填了才能让每次数据可比（自动选会换服务器，速度差异很大）\n'
+    printf 'AUTO_TEST_SERVER_ID="%s"\n' "${AUTO_TEST_SERVER_ID:-}"
   } >"$CONF"
 }
 
@@ -1609,6 +1612,17 @@ iface_rate_mbps() {
   }'
 }
 
+hour_has_record() {
+  # 本小时是否已有测速记录。定时器在 :00 和 :30 各触发一次，
+  # 整点成功就够本小时的了，半点那次靠这个跳过，避免一小时两条重复数据。
+  local dir="$1" cur f
+  cur=$(date '+%Y%m%d_%H')
+  for f in "$dir"/speedtest_"$cur"*; do
+    [ -f "$f" ] && return 0
+  done
+  return 1
+}
+
 record_speedtest() {
   # 跑一次测速并写入历史目录（供「带宽健康报告」读取）。
   # $1 = auto 时先等链路空闲，避免在晚高峰跟用户抢带宽。
@@ -1629,32 +1643,70 @@ record_speedtest() {
   if [ "$mode" = "auto" ]; then
     pct="${AUTO_TEST_IDLE_PCT:-15}"
     maxwait="${AUTO_TEST_MAXWAIT:-900}"
+    case "$maxwait" in '' | *[!0-9]*) maxwait=900 ;; esac
+    # 上限 25 分钟：定时器 :00 和 :30 各触发一次，等太久会和下一次撞车
+    [ "$maxwait" -le 1500 ] 2>/dev/null || maxwait=1500
+    case "$pct" in '' | *[!0-9]*) pct=15 ;; esac
+    [ "$pct" -le 100 ] 2>/dev/null || pct=100
+
+    # 本小时已经测过就不再测（:00 成功 → :30 自动跳过）
+    if hour_has_record "$dir"; then
+      logline "SPEEDTEST skip already-done-this-hour"
+      say "  本小时已有测速记录，跳过"
+      return 0
+    fi
+
     cap_e=$(unit_num "${RATE_EGRESS:-$RATE}")
     cap_i=$(unit_num "${RATE_INGRESS:-$RATE}")
-    say "  等待链路空闲：出/入都低于上限的 ${pct}% 才开测，最多等 $((maxwait / 60)) 分钟"
+    say "  等链路空闲：出/入都低于上限的 ${pct}% 才开测，最多等 $((maxwait / 60)) 分钟，仍忙就放弃本次"
+    waited=$SECONDS
     while :; do
       read -r mb_in mb_out <<<"$(iface_rate_mbps "$ifc")"
       if awk -v a="$mb_out" -v b="$mb_in" -v ce="$cap_e" -v ci="$cap_i" -v p="$pct" \
         'BEGIN{exit !(a < ce * p / 100 && b < ci * p / 100)}'; then
         break
       fi
-      if [ "$waited" -ge "$maxwait" ]; then
-        logline "SPEEDTEST skip busy out=${mb_out}M in=${mb_in}M waited=${waited}s"
-        note "链路一直不空闲（出 ${mb_out} / 入 ${mb_in} Mbps），本次跳过，不打扰用户"
+      if [ $((SECONDS - waited)) -ge "$maxwait" ]; then
+        logline "SPEEDTEST skip busy out=${mb_out}M in=${mb_in}M waited=$((SECONDS - waited))s"
+        note "等了 $((maxwait / 60)) 分钟链路一直不空闲（最近一次 出 ${mb_out} / 入 ${mb_in} Mbps），本次跳过，不跟用户抢带宽"
+        dim "  半小时后会自动再检查一次"
         return 0
       fi
+      # 等待过程要看得见，否则 journal 里只有一行开头，不知道卡在哪
+      printf '    %s  出 %s / 入 %s Mbps，仍有负载，30 秒后复查（已等 %d 秒 / 上限 %d 秒）\n' \
+        "$(date '+%H:%M:%S')" "$mb_out" "$mb_in" "$((SECONDS - waited))" "$maxwait"
       sleep 30
-      waited=$((waited + 30))
     done
+    logline "SPEEDTEST idle out=${mb_out}M in=${mb_in}M"
     say "  链路空闲（出 ${mb_out} / 入 ${mb_in} Mbps），开始测速"
   fi
 
+  # Ookla CLI 需要 HOME 才能读到 ~/.config/ookla 里的 license，
+  # systemd 服务默认不设 HOME，会直接抛 basic_string::_M_construct 崩溃。
+  # 这里显式兜一层，避免换个调用方式（cron / timer）就静默失败。
+  local st_opt="" home_dir="${HOME:-/root}"
+  if [ "$(basename "$bin")" = "speedtest" ]; then
+    st_opt="--accept-license --accept-gdpr"
+    [ -n "${AUTO_TEST_SERVER_ID:-}" ] && st_opt="$st_opt --server-id=$AUTO_TEST_SERVER_ID"
+  fi
+
   say "  正在测速，约 15~30 秒，期间会短暂占用带宽..."
-  if ! out=$("$bin" 2>&1); then
-    logline "SPEEDTEST fail"
-    bad "测速失败"
-    printf '%s\n' "$out" | head -3 | sed 's/^/    /'
-    return 1
+  # shellcheck disable=SC2086
+  if ! out=$(HOME="$home_dir" "$bin" $st_opt 2>&1); then
+    note "第一次失败，5 秒后重试一次"
+    sleep 5
+    # shellcheck disable=SC2086
+    if ! out=$(HOME="$home_dir" "$bin" $st_opt 2>&1); then
+      logline "SPEEDTEST fail"
+      bad "测速失败"
+      printf '%s\n' "$out" | head -4 | sed 's/^/    /'
+      case "$out" in
+        *basic_string* | *logic_error*)
+          dim "  这个报错通常是缺少 HOME：  sudo cake speedtest 手动跑一次可验证"
+          ;;
+      esac
+      return 1
+    fi
   fi
 
   ts=$(date '+%Y%m%d_%H%M%S')
@@ -1679,16 +1731,20 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# Ookla speedtest 需要 HOME 才能读 ~/.config/ookla，缺了会崩（实测过）
+Environment=HOME=%h
 ExecStart=/usr/local/sbin/cake-fairshare speedtest --auto
 TimeoutStartSec=1800
+# 测速是后台任务，优先级压低，别跟转发抢 CPU
+Nice=10
 EOF
   cat >"${SPEEDTEST_UNIT%.service}.timer" <<'EOF'
 [Unit]
-Description=Hourly speedtest at the top of the hour
+Description=Speedtest twice an hour (:00 and :30), runs only when the link is idle
 
 [Timer]
-OnCalendar=*-*-* *:00:00
-AccuracySec=30s
+OnCalendar=*-*-* *:00,30:00
+AccuracySec=10s
 Persistent=false
 Unit=cake-fairshare-speedtest.service
 
@@ -1730,7 +1786,7 @@ menu_log() {
   local act n
   say ""
   say "  采样日志：每分钟记录一次上行/下行实速与队列统计，用于事后判断是否被平台限速"
-  say "  自动测速：每小时整点检查链路是否空闲，空闲才跑，结果进「带宽健康报告」"
+  say "  自动测速：每小时 :00 与 :30 各检查一次，链路空闲才跑，一小时最多一条记录"
   hr
   say "  1) 开启每分钟采样"
   say "  2) 关闭采样"
@@ -1740,7 +1796,7 @@ menu_log() {
   say "  6) 开启每天 23:00 自动日报"
   say "  7) 关闭自动日报"
   say "  8) 查看日报"
-  say "  9) 开启每小时自动测速（整点先等链路空闲再测）"
+  say "  9) 开启自动测速（每小时 :00/:30 空闲时跑，忙则跳过）"
   say " 10) 关闭自动测速"
   say " 11) 立即测速一次（马上跑，不等空闲）"
   read -rp "选择 [默认 1]: " act
@@ -1788,7 +1844,7 @@ menu_log() {
       ;;
     9)
       if install_speedtest_timer; then
-        ok "已开启：每小时整点检查空闲后自动测速"
+        ok "已开启：每小时 :00 与 :30 各检查一次，链路空闲才测速"
         dim "  查看： systemctl list-timers cake-fairshare-speedtest.timer"
         dim "  若整点链路正忙，最多等 $(( ${AUTO_TEST_MAXWAIT:-900} / 60 )) 分钟后跳过，不会跟用户抢带宽"
       else
@@ -2100,6 +2156,7 @@ draw_menu() {
   say "  9) 高级：分方向微调 / cake 参数（一般不用动）"
   say " 10) 采样日志与现场诊断"
   say " 11) 带宽健康报告（是否被限速，可给小白看）"
+  say " 12) 立即测速并记录（马上跑，不等空闲）"
   say "  0) 退出"
   hr
   # 主动提示：缺什么就直接说，不用用户自己去逐项翻
@@ -2134,6 +2191,7 @@ main_menu() {
       9) menu_advanced ;;
       10) menu_log ;;
       11) health_report; pause ;;
+      12) record_speedtest now; pause ;;
       0|q|Q) say ""; exit 0 ;;
       *) note "无效输入"; sleep 1 ;;
     esac
