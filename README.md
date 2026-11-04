@@ -77,10 +77,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/hankepeng/cake-fairshare/mai
 
 已有配置的机器重复执行安装脚本时**不会覆盖配置**，只做 apply，可以放心当作升级命令用。
 
-装完想让它自己判断该配成什么样，跑一条：
+装完之后，**输入 `cake` 就能进菜单**（安装脚本会自动建这个短命令）：
 
 ```bash
-sudo cake-fairshare optimize
+cake
+```
+
+想让它自己判断该配成什么样，跑一条：
+
+```bash
+sudo cake optimize
 ```
 
 它会分析机器、给出推荐、一次确认后把该配的都配好。细节见下面的「智能分析与一键优化」。
@@ -191,7 +197,7 @@ cake-fairshare optimize    # 分析 + 一键应用
 ## 交互菜单
 
 ```
-  CAKE 公平带宽分配 v3.0.0   美国1 · Debian GNU/Linux 12 (bookworm)
+  CAKE 公平带宽分配 v3.0.1   美国1 · Debian GNU/Linux 12 (bookworm)
 ------------------------------------------------------------
   状态：● 运行中      网卡 ens5   下行 168mbit / 上行 180mbit   方向 both
 ------------------------------------------------------------
@@ -220,6 +226,7 @@ cake-fairshare optimize    # 分析 + 一键应用
 ## 命令行
 
 ```bash
+cake                           # 短命令，等价于不带参数的 cake-fairshare
 cake-fairshare                  # 交互菜单
 cake-fairshare apply            # 按配置启用（无交互，systemd 使用）
 cake-fairshare stop             # 撤销整形，恢复启用前的 qdisc
@@ -326,6 +333,7 @@ cake-fairshare health
 | 路径 | 用途 |
 |---|---|
 | `/usr/local/sbin/cake-fairshare` | 程序本体 |
+| `/usr/local/sbin/cake` | 指向程序本体的软链接，输入 `cake` 即可进菜单 |
 | `/etc/cake-fairshare/config` | 网卡 / 带宽 / 方向 / 高级参数 |
 | `/etc/cake-fairshare/state.<网卡>` | 启用前的 qdisc 与 ifb 名，用于精确回滚 |
 | `/etc/systemd/system/cake-fairshare.service` | 开机自启单元（菜单第 6 项生成） |

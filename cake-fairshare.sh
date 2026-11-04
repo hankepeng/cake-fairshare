@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -27,6 +27,7 @@ CONF_DIR="/etc/cake-fairshare"
 CONF="${CONF_DIR}/config"
 UNIT="/etc/systemd/system/cake-fairshare.service"
 SELF_INSTALL="/usr/local/sbin/cake-fairshare"
+ALIAS_LINK="/usr/local/sbin/cake"
 LOG_FILE="/var/log/cake-fairshare.log"
 SAMPLE_LOG="/var/log/cake-fairshare-sample.log"
 SAMPLE_STATE="/var/lib/cake-fairshare/last"
@@ -773,10 +774,25 @@ menu_stop() {
   pause
 }
 
+install_alias() {
+  # 建一个短命令，输入 cake 就等于 cake-fairshare
+  [ -x "$SELF_INSTALL" ] || return 0
+  # 已经有同名的真实文件（别的软件装的），别去覆盖别人
+  if [ -e "$ALIAS_LINK" ] && [ ! -L "$ALIAS_LINK" ]; then
+    return 0
+  fi
+  ln -sfn "$SELF_INSTALL" "$ALIAS_LINK" 2>/dev/null || true
+}
+
 install_service() {
-  if [ ! -x "$SELF_INSTALL" ]; then
+  local me
+  me=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+  # 经软链接 cake 调用时 $0 指向的就是目标文件本身，
+  # 再 install 到自己会边读边写把文件截断，必须跳过
+  if [ ! -x "$SELF_INSTALL" ] && [ "$me" != "$(readlink -f "$SELF_INSTALL" 2>/dev/null)" ]; then
     install -m 0755 "$0" "$SELF_INSTALL" 2>/dev/null || return 1
   fi
+  install_alias
   [ -r "$CONF" ] || return 1
   cat >"$UNIT" <<'EOF'
 [Unit]
@@ -880,6 +896,7 @@ do_init() {
   else
     bad "开机自启设置失败，可稍后用菜单第 6 项"
   fi
+  install_alias
 
   say ""
   say "下一步（可选）："
@@ -1683,8 +1700,10 @@ do_optimize() {
       ;;
   esac
 
+  install_alias
   say ""
   dim "  验证：本菜单第 3 项（状态）/ 第 11 项（一周后看趋势）"
+  dim "  短命令：直接输入 cake 即可进菜单"
   return 0
 }
 
@@ -1780,6 +1799,7 @@ usage() {
 cake-fairshare v${VERSION} — 按在线人数自动平分带宽
 
   cake-fairshare                交互菜单（推荐）
+  cake                          同上，短命令（软链接，装自启时自动创建）
   cake-fairshare apply          按配置启用（无交互，供 systemd 用）
   cake-fairshare stop           撤销整形并恢复原 qdisc
   cake-fairshare status         状态快照

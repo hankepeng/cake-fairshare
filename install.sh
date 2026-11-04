@@ -71,6 +71,13 @@ fi
 install -m 0755 "$tmp" "$TARGET"
 echo ">> 已安装到 ${TARGET}"
 
+# 短命令：输入 cake 就进菜单
+ALIAS="/usr/local/sbin/cake"
+if [ ! -e "$ALIAS" ] || [ -L "$ALIAS" ]; then
+  ln -sfn "$TARGET" "$ALIAS"
+  echo ">> 短命令已就绪：cake"
+fi
+
 if [ "$DO_INIT" -eq 0 ]; then
   echo
   echo "已跳过配置。需要时执行： sudo cake-fairshare init"
