@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.9.1"
+VERSION="3.0.0"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -129,6 +129,14 @@ load_conf() {
 
 save_conf() {
   mkdir -p "$CONF_DIR"
+  # 与基准值相同的分方向设置等于没设，顺手清掉：
+  # 否则配置里会留着 RATE_EGRESS=168 这种冗余，用户看到会以为改它有用。
+  if [ -n "${RATE_EGRESS:-}" ] && [ "$(unit_num "$RATE_EGRESS")" = "$(unit_num "$RATE")" ]; then
+    RATE_EGRESS=""
+  fi
+  if [ -n "${RATE_INGRESS:-}" ] && [ "$(unit_num "$RATE_INGRESS")" = "$(unit_num "$RATE")" ]; then
+    RATE_INGRESS=""
+  fi
   {
     printf '# 由 cake-fairshare 生成，手工修改后执行 apply 生效\n'
     printf 'NODE_NAME="%s"\n' "${NODE_NAME:-}"
@@ -567,6 +575,21 @@ do_name() {
 }
 
 menu_enable() {
+  local act
+  load_conf
+  say ""
+  say "${B}配置整形${R}"
+  hr
+  say "  1) 一键优化：先分析机器，再套用推荐配置        ← 推荐"
+  say "  2) 自定义：手动选网卡、带宽、方向"
+  read -rp "选择 [默认 1]: " act
+  case "${act:-1}" in
+    2) menu_custom ;;
+    *) do_optimize; pause ;;
+  esac
+}
+
+menu_custom() {
   local ifc_list def sel rate mode confirm chosen n pick ifc i ack def_idx=1
   local cur="" ovr=0 r_eg="" r_in=""
   load_conf
@@ -1335,6 +1358,33 @@ show_daily() {
   tail -n 120 "$DAILY_LOG" | sed 's/^/  /'
 }
 
+install_log_timer() {
+  cat >"$LOG_UNIT" <<'EOF'
+[Unit]
+Description=CAKE fair-share bandwidth sampling
+After=cake-fairshare.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cake-fairshare log
+EOF
+  cat >"${LOG_UNIT%.service}.timer" <<'EOF'
+[Unit]
+Description=Sample CAKE bandwidth every minute
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=cake-fairshare-log.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now cake-fairshare-log.timer >/dev/null 2>&1
+}
+
 menu_log() {
   local act n
   say ""
@@ -1351,30 +1401,7 @@ menu_log() {
   read -rp "选择 [默认 1]: " act
   case "${act:-1}" in
     1)
-      cat >"$LOG_UNIT" <<'EOF'
-[Unit]
-Description=CAKE fair-share bandwidth sampling
-After=cake-fairshare.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/cake-fairshare log
-EOF
-      cat >"${LOG_UNIT%.service}.timer" <<'EOF'
-[Unit]
-Description=Sample CAKE bandwidth every minute
-
-[Timer]
-OnBootSec=90s
-OnUnitActiveSec=60s
-AccuracySec=5s
-Unit=cake-fairshare-log.service
-
-[Install]
-WantedBy=timers.target
-EOF
-      systemctl daemon-reload
-      if systemctl enable --now cake-fairshare-log.timer >/dev/null 2>&1; then
+      if install_log_timer; then
         ok "已开启，每分钟采样一次（日志：$SAMPLE_LOG）"
         dim "  首次采样在 90 秒后，第二分钟起才有速率数据"
       else
@@ -1419,6 +1446,263 @@ EOF
 }
 
 # ---------------------------------------------------------------- 主菜单 ----
+# ---------------------------------------------------------- 智能分析与优化 ----
+
+client_ip_count() {
+  local lports
+  lports=$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed -E 's/.*://' | grep -vx '22' | sort -u | tr '\n' ',')
+  if [ -z "$lports" ]; then printf '0\n'; return 0; fi
+  ss -Htn state established 2>/dev/null \
+    | awk -v lp=",$lports" '{ n = split($3, a, ":"); if (index(lp, "," a[n] ",") > 0) print $4 }' \
+    | sed -E 's/:[0-9]+$//' | sort -u | wc -l | tr -d ' '
+}
+
+speedtest_peaks() {
+  # 输出 "下行峰值 上行峰值 记录条数"
+  local dir="${SPEEDTEST_DIR:-/root/speedtest_history}" f dl ul mxd=0 mxu=0 n=0
+  if [ -d "$dir" ]; then
+    for f in $(ls -1t "$dir"/* 2>/dev/null | head -n 30); do
+      dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+      ul=$(grep -m1 'Upload:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+      [ -n "$dl" ] || continue
+      n=$((n + 1))
+      mxd=$(awk -v a="$mxd" -v b="$dl" 'BEGIN{print (b > a) ? b : a}')
+      if [ -n "$ul" ]; then
+        mxu=$(awk -v a="$mxu" -v b="$ul" 'BEGIN{print (b > a) ? b : a}')
+      fi
+    done
+  fi
+  printf '%s %s %s\n' "$mxd" "$mxu" "$n"
+}
+
+sample_peaks() {
+  # 输出 "出口峰值 入口峰值 最大积压 样本数"
+  if [ ! -r "$SAMPLE_LOG" ]; then
+    printf '0 0 0 0\n'
+    return 0
+  fi
+  awk -F, '
+    { if ($3 + 0 > mt) mt = $3 + 0
+      if ($2 + 0 > mr) mr = $2 + 0
+      if ($14 + 0 > mb) mb = $14 + 0
+      if ($15 + 0 > mbi) mbi = $15 + 0 }
+    END { printf "%.1f %.1f %d %d\n", mt, mr, (mb > mbi ? mb : mbi), NR }' "$SAMPLE_LOG"
+}
+
+recommend_rate() {
+  # 计算推荐带宽 → REC_EG / REC_IN / REC_WHY / REC_SUGGEST / REC_HINT
+  #
+  # 安全原则（血泪教训）：**机器已经在限速时，绝不自动改这个数字**。
+  # 因为测速历史里可能包含"临时关掉整形"测出来的值（实测见过 190M 的机器测出 415M），
+  # 拿它 ×95% 会推荐到远超套餐的数值，一键点下去就可能被平台限速。
+  # 只有从未限过速的机器（新装），才用测速峰值当作起点。
+  local cur_eg cur_in pu pd _n has_conf=0 d_eg d_in
+  # 注意：load_conf 会把 RATE 默认成 DEF_RATE，所以不能只看 RATE 是否有值，
+  # 必须看配置文件到底存不存在，否则新机器永远走不到"按测速取值"这一支。
+  [ -r "$CONF" ] && has_conf=1
+  cur_eg=$(unit_num "${RATE_EGRESS:-$RATE}")
+  cur_in=$(unit_num "${RATE_INGRESS:-$RATE}")
+  read -r pu pd _n <<<"$(speedtest_peaks)"
+
+  REC_EG=0; REC_IN=0; REC_WHY=""; REC_SUGGEST=0; REC_HINT=""
+
+  if [ "$has_conf" -eq 1 ] && [ "${cur_eg:-0}" -gt 0 ] 2>/dev/null; then
+    REC_EG=$cur_eg
+    REC_IN=${cur_in:-$cur_eg}
+    REC_WHY="沿用当前出口 ${cur_eg} / 入口 ${REC_IN} Mbps（已在限速，不自动改动这个数字）"
+    if awk -v p="$pu" -v c="$cur_eg" 'BEGIN{exit !(p > c * 2)}'; then
+      REC_HINT="测速历史里出方向到过 ${pu} Mbps，是当前上限的 $((pu / cur_eg * 100 / 100)) 倍多——那次多半是关掉整形测的，不能当稳态能力"
+    elif awk -v p="$pu" -v c="$cur_eg" 'BEGIN{exit !(p > c * 1.02)}'; then
+      REC_SUGGEST=$(awk -v p="$pu" 'BEGIN{printf "%d", p * 0.95}')
+      REC_HINT="测速历史里出方向到过 ${pu} Mbps，比当前上限 ${cur_eg} 高；若套餐带宽确实更大，可上调到 ${REC_SUGGEST} Mbps"
+    else
+      REC_HINT=""
+    fi
+  else
+    # 新机器：机器上可能还留着别的限速脚本，先沿用它的速率，其次才看测速
+    read -r d_eg d_in <<<"$(detect_existing_rate "$(primary_iface)")"
+    if [ -n "$d_eg" ]; then
+      REC_EG=$(unit_num "$d_eg")
+      REC_IN=$(unit_num "${d_in:-$d_eg}")
+      [ "$REC_IN" -gt 0 ] 2>/dev/null || REC_IN=$REC_EG
+      REC_WHY="机器上已有整形脚本，沿用它的速率：出口 ${REC_EG} / 入口 ${REC_IN} Mbps"
+    elif awk -v p="$pu" 'BEGIN{exit !(p > 0)}'; then
+      REC_EG=$(awk -v p="$pu" 'BEGIN{printf "%d", p * 0.95}')
+      REC_IN=$REC_EG
+      REC_WHY="没有历史整形，按测速历史出方向峰值 ${pu} Mbps 的 95% 取"
+    else
+      REC_EG=$(unit_num "$DEF_RATE")
+      REC_IN=$REC_EG
+      REC_WHY="没有测速记录，先用默认 ${DEF_RATE}；跑一次测速后再优化会自己调准"
+    fi
+  fi
+  [ "${REC_IN:-0}" -le 0 ] 2>/dev/null && REC_IN=$REC_EG
+  return 0
+}
+
+render_analysis() {
+  local ifc a4 eg in pu pd sn sb _x sam_n conn cip
+  load_conf
+  ifc=$(printf '%s' "${IFACES:-}" | awk '{print $1}')
+  [ -n "$ifc" ] || ifc=$(primary_iface)
+  eg=$(unit_num "${RATE_EGRESS:-$RATE}")
+  in=$(unit_num "${RATE_INGRESS:-$RATE}")
+  read -r pu pd sn <<<"$(speedtest_peaks)"
+  read -r sb _x sam_bk sam_n <<<"$(sample_peaks)"
+  conn=$(ss -Htn state established 2>/dev/null | wc -l | tr -d ' ')
+  cip=$(client_ip_count)
+  a4=$(ip -4 -br addr show dev "$ifc" 2>/dev/null | awk '{print $3}' | head -n1)
+
+  say ""
+  say "${B}智能分析${R}"
+  hr
+  printf '  节点      %s · %s\n' "${NODE_NAME:-未命名}" "$(os_pretty)"
+  local memt swap
+  memt=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+  if [ -n "$(swapon --show 2>/dev/null)" ]; then swap="有 swap"; else swap="无 swap"; fi
+  printf '  硬件      %s 核 / %sMB 内存 / %s\n' "$(nproc 2>/dev/null)" "${memt:-?}" "$swap"
+  case "$a4" in
+    10.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | 192.168.*)
+      printf '  网卡      %s   %s   %bEIP/NAT：出方向才是平台限速点%b\n' "$ifc" "$a4" "$Y" "$R"
+      ;;
+    *)
+      printf '  网卡      %s   %s\n' "$ifc" "$a4"
+      ;;
+  esac
+  if is_active; then
+    printf '  整形      %b● 运行中%b   出口 %s / 入口 %s Mbps\n' "$G" "$R" "${eg:-?}" "${in:-?}"
+  else
+    printf '  整形      %b○ 未启用%b\n' "$Y" "$R"
+  fi
+  if [ "${sn:-0}" -gt 0 ] 2>/dev/null; then
+    printf '  测速      %s 次，下行峰值 %s / 上行峰值 %s Mbps\n' "$sn" "$pu" "$pd"
+  else
+    printf '  测速      无记录（跑一次 speedtest 后推荐值会准得多）\n'
+  fi
+  if [ "${sam_n:-0}" -gt 0 ] 2>/dev/null; then
+    printf '  采样      %s 条，出口峰值 %s Mbps，最大积压 %s 字节\n' "$sam_n" "$sb" "${sam_bk:-0}"
+  else
+    printf '  采样      无数据\n'
+  fi
+  printf '  并发      %s 个客户端 IP / %s 条连接\n' "${cip:-0}" "${conn:-0}"
+  hr
+}
+
+do_optimize() {
+  local ifc ans shapers
+  load_conf
+  require_root
+
+  ifc=$(printf '%s' "${IFACES:-}" | awk '{print $1}')
+  [ -n "$ifc" ] || ifc=$(primary_iface)
+  if [ -z "$ifc" ]; then bad "找不到默认路由网卡，请手动用第 2 项自定义"; return 1; fi
+
+  render_analysis
+  recommend_rate
+
+  say ""
+  printf '  推荐      %b出口 %s / 入口 %s Mbps%b\n' "$B" "$REC_EG" "$REC_IN" "$R"
+  printf '  理由      %s\n' "$REC_WHY"
+  if [ -n "$REC_HINT" ]; then
+    printf '  提示      %s\n' "$REC_HINT"
+  fi
+  if [ "${REC_SUGGEST:-0}" -gt 0 ] 2>/dev/null; then
+    read -rp "  是否同时把带宽上调到 ${REC_SUGGEST} Mbps ？（默认不动）[y/N]: " ans
+    case "${ans:-N}" in
+      y | Y) REC_EG=$REC_SUGGEST; REC_IN=$REC_SUGGEST ;;
+    esac
+  fi
+
+  shapers=$(find_shaper_units 2>/dev/null)
+  local miss=""
+  systemctl is-enabled cake-fairshare >/dev/null 2>&1 || miss="${miss}开机自启 "
+  systemctl is-enabled cake-fairshare-log.timer >/dev/null 2>&1 || miss="${miss}每分钟采样 "
+  systemctl is-enabled cake-fairshare-report.timer >/dev/null 2>&1 || miss="${miss}每日日报 "
+  [ -n "${CAKE_OPTS_INGRESS:-}" ] || miss="${miss}ack-filter "
+  if [ -n "$miss" ]; then
+    printf '  待补齐    %b%s%b\n' "$Y" "$miss" "$R"
+  else
+    printf '  待补齐    %b无，已经是最优状态%b\n' "$G" "$R"
+  fi
+  hr
+
+  say ""
+  say "${B}将要执行${R}"
+  hr
+  say "  · 网卡      $ifc"
+  say "  · 带宽      出口 ${REC_EG} / 入口 ${REC_IN} Mbps"
+  if [ -z "${CAKE_OPTS_INGRESS:-}" ]; then
+    say "  · 入口参数  补上 ack-filter（跨国链路压缩上行 ACK）"
+  fi
+  if [ -n "$shapers" ]; then
+    say "  · 停用冲突  $(printf '%s' "$shapers" | awk -F'|' '{printf "%s ", $1}')"
+  fi
+  case "$miss" in *开机自启*) say "  · 开机自启  安装" ;; esac
+  case "$miss" in *每分钟采样*) say "  · 每分钟采样  开启" ;; esac
+  case "$miss" in *每日日报*) say "  · 每日日报  开启（每天 23:00）" ;; esac
+  say ""
+  read -rp "  确认执行？[Y/n]: " ans
+  case "${ans:-Y}" in
+    n | N) note "已取消"; return 0 ;;
+  esac
+
+  say ""
+  if [ -n "$shapers" ]; then cleanup_conflicts; fi
+
+  IFACES="$ifc"; RATE="${REC_EG}mbit"; MODE="both"
+  RATE_EGRESS=""
+  if [ "${REC_IN}" -ne "${REC_EG}" ]; then
+    RATE_INGRESS="${REC_IN}mbit"
+  else
+    RATE_INGRESS=""
+  fi
+  [ -n "${CAKE_OPTS_INGRESS:-}" ] || CAKE_OPTS_INGRESS="ack-filter"
+  save_conf
+  ok "配置：网卡 $IFACES  出口 ${RATE_EGRESS:-$RATE}  入口 ${RATE_INGRESS:-$RATE}"
+
+  if do_apply; then
+    ok "整形已生效"
+  else
+    bad "启用失败，见上方提示"
+    return 1
+  fi
+
+  case "$miss" in
+    *开机自启*)
+      if install_service; then ok "已设置开机自启"; else bad "开机自启设置失败"; fi
+      ;;
+  esac
+  case "$miss" in
+    *每分钟采样*)
+      if install_log_timer; then ok "已开启每分钟采样"; fi
+      ;;
+  esac
+  case "$miss" in
+    *每日日报*)
+      if install_daily_timer; then ok "已开启每日 23:00 日报"; fi
+      ;;
+  esac
+
+  say ""
+  dim "  验证：本菜单第 3 项（状态）/ 第 11 项（一周后看趋势）"
+  return 0
+}
+
+do_analyze() {
+  load_conf
+  require_root
+  render_analysis
+  recommend_rate
+  say ""
+  printf '  推荐      %b出口 %s / 入口 %s Mbps%b\n' "$B" "$REC_EG" "$REC_IN" "$R"
+  printf '  理由      %s\n' "$REC_WHY"
+  if [ -n "$REC_HINT" ]; then
+    printf '  提示      %s\n' "$REC_HINT"
+  fi
+  say ""
+  dim "  一键应用： cake-fairshare optimize"
+}
+
 draw_menu() {
   load_conf
   if [ -t 1 ]; then clear; fi
@@ -1441,18 +1725,30 @@ draw_menu() {
   fi
   hr
   say "  1) 环境自检（系统 / 内核 / 网卡 / qdisc / BBR / cake 支持）"
-  say "  2) 启用或重新配置整形"
+  say "  2) 一键优化 / 自定义配置（先分析再套用推荐值）"
   say "  3) 查看当前状态快照"
   say "  4) 实时流量监控"
   say "  5) 停止整形并恢复原始 qdisc"
   say "  6) 开机自启（安装 / 移除 / 查看）"
-  say "  7) 调整带宽"
+  say "  7) 只改带宽（不动网卡与方向）"
   say "  8) IPv6 与多 IP 用户说明（进阶）"
-  say "  9) 高级参数（cake 选项 / 上下行分别限速）"
+  say "  9) 高级：分方向微调 / cake 参数（一般不用动）"
   say " 10) 采样日志与现场诊断"
   say " 11) 带宽健康报告（是否被限速，可给小白看）"
   say "  0) 退出"
   hr
+  # 主动提示：缺什么就直接说，不用用户自己去逐项翻
+  local tips=""
+  if [ -r "$CONF" ]; then
+    is_active || tips="$tips 未启用整形"
+    [ -n "${CAKE_OPTS_INGRESS:-}" ] || tips="$tips 未开 ack-filter"
+    systemctl is-enabled cake-fairshare-log.timer >/dev/null 2>&1 || tips="$tips 未开采样"
+    systemctl is-enabled cake-fairshare-report.timer >/dev/null 2>&1 || tips="$tips 未开日报"
+  fi
+  if [ -n "$tips" ]; then
+    printf '  %b建议%b%s  → 选 2 一键补齐\n' "$Y" "$R" "$tips"
+    hr
+  fi
 }
 
 main_menu() {
@@ -1494,6 +1790,8 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare health         带宽健康报告（限速历史）
   cake-fairshare daily          生成一次日报（供 timer 调用）
   cake-fairshare name [名称]    设置/查看节点名称
+  cake-fairshare optimize       分析机器并一键套用推荐配置（最常用）
+  cake-fairshare analyze        只分析、给推荐，不改任何东西
   cake-fairshare init [带宽] [--clean]
                                 一键配置并启用；--clean 自动停用冲突的限速服务
   cake-fairshare preflight      只检查环境，不改任何东西
@@ -1508,6 +1806,8 @@ EOF
 case "${1:-}" in
   "")             main_menu ;;
   apply)          require_root; do_apply ;;
+  optimize)       require_root; do_optimize ;;
+  analyze|advise) require_root; do_analyze ;;
   stop)           require_root; do_stop ;;
   status)         require_root; show_status ;;
   monitor)        require_root; load_conf; monitor "${2:-}" ;;
