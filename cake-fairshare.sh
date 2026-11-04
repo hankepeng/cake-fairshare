@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.4"
+VERSION="3.6.5"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -311,7 +311,7 @@ EOF
 
 apply_one() {
   local ifc="$1" rate="$2" mode="$3"
-  local qdisc="cake" orig cur prev_orig prev_ifb ifb="" idx=0
+  local qdisc="cake" orig cur cur_bw="" prev_orig prev_ifb ifb="" idx=0
   local r_eg r_in
   r_eg="${RATE_EGRESS:-$rate}"
   r_in="${RATE_INGRESS:-$rate}"
@@ -366,6 +366,18 @@ apply_one() {
 
   clear_state "$ifc"
   put_state "$ifc" ORIG_QDISC "$orig"
+
+  # 对已存在的 cake 做 replace 实际是 change，CAKE 的 capacity estimate 会
+  # 沿用旧值（实测从 190 改到 1000 后仍显示 190Mbit）。带宽变了就重建根队列，
+  # 让估算值随新配置重置；带宽没变则保持原队列，不重置统计。
+  if [ "$cur" = "cake" ] || [ "$cur" = "cake_mq" ]; then
+    cur_bw=$(tc qdisc show dev "$ifc" 2>/dev/null \
+      | awk 'NR==1 {for (i=1; i<=NF; i++) if ($i=="bandwidth") print $(i+1)}')
+    if [ -n "$cur_bw" ] && [ "$(unit_num "$cur_bw")" != "$(unit_num "$r_eg")" ]; then
+      tc qdisc del dev "$ifc" root >/dev/null 2>&1
+      logline "APPLY recreate $ifc bandwidth $cur_bw -> $r_eg"
+    fi
+  fi
 
   # shellcheck disable=SC2086
   if ! tc qdisc replace dev "$ifc" root "$qdisc" bandwidth "$r_eg" dual-dsthost ${CAKE_OPTS:-} 2>/dev/null; then
@@ -1426,6 +1438,9 @@ diagnose() {
     ok "链路已接近整形上限：此时测速偏低属正常，是自己在占用带宽"
   elif [ "$pct" -ge 40 ]; then
     note "带宽有一半左右在跑，速度还不理想的话看连接数是否分散"
+  elif awk -v v="$tx_m" -v c="$egr" 'BEGIN{exit !(v < c * 0.05)}'; then
+    note "当前几乎空闲（出口占用 ${pct}%），此刻无法判断是否被限速"
+    dim "  请在真正卡顿的时候再跑 cake check；想测链路能力用第 12 项或有空时看 cake health"
   else
     bad "本机几乎空闲却慢 —— 整形不是瓶颈，问题在上游链路、跨境路由或平台侧限速"
     dim "  排查顺序： ping/mtr 到客户端 → 看是否晚高峰 → 对比历史采样日志"
