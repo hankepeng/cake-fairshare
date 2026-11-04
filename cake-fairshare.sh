@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="2.6.2"
+VERSION="2.7.0"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -31,6 +31,8 @@ LOG_FILE="/var/log/cake-fairshare.log"
 SAMPLE_LOG="/var/log/cake-fairshare-sample.log"
 SAMPLE_STATE="/var/lib/cake-fairshare/last"
 LOG_UNIT="/etc/systemd/system/cake-fairshare-log.service"
+DAILY_LOG="/var/log/cake-fairshare-daily.log"
+REPORT_UNIT="/etc/systemd/system/cake-fairshare-report.service"
 
 if [ -t 1 ]; then
   R=$'\033[0m'; B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; RD=$'\033[31m'; C=$'\033[36m'; D=$'\033[2m'
@@ -915,8 +917,18 @@ sample_once() {
   [ -n "$ifb" ] && io=$(qdisc_stat "$ifb" overlimits)
   cn=$(ss -Htn state established 2>/dev/null | wc -l | tr -d ' ')
 
-  printf '%s,%s,%s,%s,%s,%s,%s\n' "$(date '+%F %T')" "$rx_m" "$tx_m" \
-    "${eo:-0}" "${ed:-0}" "${io:-0}" "${cn:-0}" >>"$SAMPLE_LOG"
+  # 记录连接数最多的 3 个对端 IP（用于区分"多设备"与"多人共用出口"）
+  local a1="" c1="" a2="" c2="" a3="" c3=""
+  if [ "${cn:-0}" -gt 0 ]; then
+    read -r c1 a1 c2 a2 c3 a3 <<<"$(ss -Htn state established 2>/dev/null \
+      | awk '{print $4}' | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff://' \
+      | sort | uniq -c | sort -rn | head -3 \
+      | awk '{printf "%s %s ", $1, $2}')"
+  fi
+
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date '+%F %T')" "$rx_m" "$tx_m" \
+    "${eo:-0}" "${ed:-0}" "${io:-0}" "${cn:-0}" \
+    "${a1:-}" "${c1:-0}" "${a2:-}" "${c2:-0}" "${a3:-}" "${c3:-0}" >>"$SAMPLE_LOG"
   trim_log
 }
 
@@ -1059,6 +1071,9 @@ health_report() {
       if (cn > mc[key]) mc[key] = cn
       if (tx > gmax) { gmax = tx; gmax_t = ts }
       if (rx > gramax) gramax = rx
+      if ($8 != "" && $9 + 0 > pmax[$8]) pmax[$8] = $9 + 0
+      if ($10 != "" && $11 + 0 > pmax[$10]) pmax[$10] = $11 + 0
+      if ($12 != "" && $13 + 0 > pmax[$12]) pmax[$12] = $13 + 0
       first = (first == "" ? ts : first)
       last = ts
     }
@@ -1076,6 +1091,23 @@ health_report() {
       printf "  上行峰值：%.1f Mbps\n", gramax
       if (gmax > ce * 1.05) printf "  %s\n", "注：峰值高于整形上限，说明该时段整形被临时关闭过（例如手动测速）"
       else if (gmax < ce * 0.5) printf "  %s\n", "提示：峰值不到上限一半，可能是用户少，或上游本身跑不满"
+
+      np = 0
+      for (ip in pmax) { np++; pl[np] = ip }
+      if (np > 0) {
+        printf "\n  连接最集中的客户端 IP：\n"
+        shown = 0
+        for (i = 1; i <= np && shown < 3; i++) {
+          bi = i
+          for (j = i + 1; j <= np; j++) if (pmax[pl[j]] > pmax[pl[bi]]) bi = j
+          t = pl[i]; pl[i] = pl[bi]; pl[bi] = t
+          if (pmax[pl[i]] >= 5) {
+            printf "    %-22s 峰值 %d 条连接\n", pl[i], pmax[pl[i]]
+            shown++
+          }
+        }
+        if (shown == 0) printf "    （没有单个 IP 超过 5 条连接）\n"
+      }
     }
   ' "$SAMPLE_LOG"
   hr
@@ -1095,6 +1127,53 @@ health_report() {
   dim "        历史测速记录才是直接证据，偏低的那几条已经标出来了。"
 }
 
+install_daily_timer() {
+  cat >"$REPORT_UNIT" <<'EOF'
+[Unit]
+Description=CAKE bandwidth daily report
+After=cake-fairshare.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cake-fairshare daily
+EOF
+  cat >"${REPORT_UNIT%.service}.timer" <<'EOF'
+[Unit]
+Description=Daily CAKE bandwidth health report at 23:00
+
+[Timer]
+OnCalendar=*-*-* 23:00:00
+Persistent=true
+Unit=cake-fairshare-report.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now cake-fairshare-report.timer >/dev/null 2>&1
+}
+
+daily_report() {
+  load_conf
+  mkdir -p "$(dirname "$DAILY_LOG")" 2>/dev/null
+  {
+    printf '\n===== %s =====\n' "$(date '+%F %H:%M')"
+    health_report
+  } >>"$DAILY_LOG" 2>&1
+}
+
+show_daily() {
+  if [ ! -s "$DAILY_LOG" ]; then
+    note "还没有日报"
+    dim "  开启后每天 23:00 自动生成；也可以现在按 5 生成一次"
+    return 1
+  fi
+  say ""
+  say "${B}带宽日报${R} ${D}（$DAILY_LOG，显示最近 120 行）${R}"
+  hr
+  tail -n 120 "$DAILY_LOG" | sed 's/^/  /'
+}
+
 menu_log() {
   local act n
   say ""
@@ -1104,6 +1183,10 @@ menu_log() {
   say "  2) 关闭采样"
   say "  3) 查看最近记录"
   say "  4) 立即诊断（我现在占满没有）"
+  say "  5) 立即生成一次日报"
+  say "  6) 开启每天 23:00 自动日报"
+  say "  7) 关闭自动日报"
+  say "  8) 查看日报"
   read -rp "选择 [默认 1]: " act
   case "${act:-1}" in
     1)
@@ -1149,6 +1232,26 @@ EOF
       ;;
     4)
       diagnose
+      ;;
+    5)
+      daily_report && ok "已追加到 $DAILY_LOG"
+      ;;
+    6)
+      if install_daily_timer; then
+        ok "已开启：每天 23:00 生成日报"
+        dim "  查看： systemctl list-timers cake-fairshare-report.timer"
+      else
+        bad "开启失败，排查： systemctl status cake-fairshare-report.timer"
+      fi
+      ;;
+    7)
+      systemctl disable --now cake-fairshare-report.timer >/dev/null 2>&1
+      rm -f "${REPORT_UNIT%.service}.timer" "$REPORT_UNIT"
+      systemctl daemon-reload
+      ok "已关闭自动日报（历史文件保留）"
+      ;;
+    8)
+      show_daily
       ;;
   esac
   pause
@@ -1223,6 +1326,7 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare report [N]     查看最近 N 条采样
   cake-fairshare check          现场诊断（判断是否自身占满）
   cake-fairshare health         带宽健康报告（限速历史）
+  cake-fairshare daily          生成一次日报（供 timer 调用）
   cake-fairshare init [带宽] [--clean]
                                 一键配置并启用；--clean 自动停用冲突的限速服务
   cake-fairshare preflight      只检查环境，不改任何东西
@@ -1245,6 +1349,7 @@ case "${1:-}" in
   report)         require_root; show_report "${2:-30}" ;;
   check)          require_root; load_conf; diagnose "${2:-}" ;;
   health)         require_root; health_report ;;
+  daily)          require_root; load_conf; daily_report ;;
   preflight)      require_root; preflight ;;
   init)
     shift
