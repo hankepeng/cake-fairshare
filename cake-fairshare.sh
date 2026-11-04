@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.1"
+VERSION="3.6.2"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -1639,6 +1639,83 @@ speedtest_bin() {
   command -v speedtest 2>/dev/null || command -v speedtest-cli 2>/dev/null
 }
 
+ensure_speedtest() {
+  # 缺失时自动安装测速 CLI，结果放进 SPEEDTEST_BIN_PATH。
+  # 交互、定时器（无 tty）都走这里，不让用户自己去装。
+  local url="" pm="" installed=0
+  SPEEDTEST_BIN_PATH=$(speedtest_bin)
+  [ -n "$SPEEDTEST_BIN_PATH" ] && return 0
+
+  say ""
+  say "${B}未检测到 speedtest，正在自动安装${R}"
+  logline "SPEEDTEST install begin"
+
+  if command -v apt-get >/dev/null 2>&1; then
+    pm=apt
+    url="https://install.speedtest.net/app/cli/install.deb.sh"
+  elif command -v dnf >/dev/null 2>&1; then
+    pm=dnf
+    url="https://install.speedtest.net/app/cli/install.rpm.sh"
+  elif command -v yum >/dev/null 2>&1; then
+    pm=yum
+    url="https://install.speedtest.net/app/cli/install.rpm.sh"
+  else
+    bad "无法识别系统的包管理器，自动安装失败"
+    dim "  手动安装：https://www.speedtest.net/apps/cli"
+    logline "SPEEDTEST install fail no-pkg-manager"
+    return 1
+  fi
+
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    bad "缺少 curl/wget，无法下载安装脚本"
+    dim "  先安装：apt install -y curl   或   dnf install -y curl"
+    logline "SPEEDTEST install fail no-downloader"
+    return 1
+  fi
+
+  local tmp
+  tmp=$(mktemp) || return 1
+  say "  下载官方安装脚本：$url"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$tmp" 2>/dev/null || { rm -f "$tmp"; bad "下载安装脚本失败（检查网络/代理）"; logline "SPEEDTEST install fail download"; return 1; }
+  else
+    wget -qO "$tmp" "$url" 2>/dev/null || { rm -f "$tmp"; bad "下载安装脚本失败（检查网络/代理）"; logline "SPEEDTEST install fail download"; return 1; }
+  fi
+
+  say "  添加官方软件源..."
+  if ! bash "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    bad "官方软件源添加失败"
+    logline "SPEEDTEST install fail repo pm=$pm"
+    return 1
+  fi
+  rm -f "$tmp"
+
+  say "  安装 speedtest（首次约 30~60 秒）..."
+  case "$pm" in
+    apt)
+      apt-get update -qq >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest >/dev/null 2>&1 && installed=1
+      # 官方源不可用时退回 Debian 自带的 speedtest-cli（输出格式兼容）
+      [ "$installed" -eq 1 ] || { DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest-cli >/dev/null 2>&1 && installed=1; }
+      ;;
+    dnf) dnf install -y speedtest >/dev/null 2>&1 && installed=1 ;;
+    yum) yum install -y speedtest >/dev/null 2>&1 && installed=1 ;;
+  esac
+
+  SPEEDTEST_BIN_PATH=$(speedtest_bin)
+  if [ -n "$SPEEDTEST_BIN_PATH" ]; then
+    ok "已自动安装：$SPEEDTEST_BIN_PATH"
+    logline "SPEEDTEST install ok path=$SPEEDTEST_BIN_PATH"
+    return 0
+  fi
+
+  bad "自动安装失败"
+  dim "  可手动安装：curl -s $url | bash && apt install -y speedtest"
+  logline "SPEEDTEST install fail pkg pm=$pm"
+  return 1
+}
+
 iface_rate_mbps() {
   # 3 秒采样，输出 "入向Mbps 出向Mbps"
   local ifc="$1" a b
@@ -1668,12 +1745,8 @@ record_speedtest() {
   load_conf
   require_root
   local bin mode="${1:-now}" ifc dir ts f out dl ul waited=0 pct maxwait mb_in mb_out cap_e cap_i d
-  bin=$(speedtest_bin)
-  if [ -z "$bin" ]; then
-    bad "没有 speedtest 命令"
-    dim "  Debian/Ubuntu 安装： curl -s https://install.speedtest.net/app/cli/install.deb.sh | bash && apt install -y speedtest"
-    return 1
-  fi
+  ensure_speedtest || return 1
+  bin=$SPEEDTEST_BIN_PATH
   ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
   [ -n "$ifc" ] || ifc=$(primary_iface)
   dir="${SPEEDTEST_DIR:-$SPEEDTEST_DIR_DEF}"
