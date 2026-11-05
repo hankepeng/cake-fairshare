@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.9"
+VERSION="3.6.10"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -1859,20 +1859,21 @@ pick_speedtest_server() {
 }
 
 bootstrap_extras() {
-  # 首次安装收尾：时区、测速工具与固定测速点、三个定时任务一次配好，
-  # 不需要装完再手动进菜单点一遍。
+  # 首次安装收尾：时区、测速工具与固定测速点、采样与日报一次配好。
+  # 自动测速默认**不开**：一次测速要跑几百 MB（900M 机器约 800MB），
+  # 常驻每小时跑会持续吃掉套餐流量，交给用户按需在菜单里开。
   set_default_timezone || true
   if ensure_speedtest; then
     pick_speedtest_server || note "测速点自动固定失败，可稍后用菜单第 9 项指定"
     install_log_timer >/dev/null 2>&1 && ok "已开启每分钟采样"
     install_daily_timer >/dev/null 2>&1 && ok "已开启每日 23:00 日报"
-    if install_speedtest_timer >/dev/null 2>&1; then
-      ok "已开启自动测速（每小时 :00/:30 空闲时跑）"
-    fi
+    note "自动测速默认关闭（每次约几十到几百 MB，避免长期占用套餐流量）"
+    dim "  需要时： cake → 功能开关 → 9) 开启自动测速"
   else
-    note "测速工具安装失败，自动测速未开启；采样与日报不受影响"
+    note "测速工具安装失败；采样与日报不受影响"
     install_log_timer >/dev/null 2>&1 && ok "已开启每分钟采样"
     install_daily_timer >/dev/null 2>&1 && ok "已开启每日 23:00 日报"
+    dim "  装好测速工具后： cake → 功能开关 → 9) 开启自动测速"
   fi
 }
 
@@ -1995,6 +1996,8 @@ record_speedtest() {
 }
 
 install_speedtest_timer() {
+  # $1=0 只写 unit、不启用（升级同步时用：用户没开过的功能不能替用户打开）
+  local do_enable="${1:-1}"
   cat >"$SPEEDTEST_UNIT" <<'EOF'
 [Unit]
 Description=CAKE speedtest (waits for an idle link before running)
@@ -2024,7 +2027,9 @@ Unit=cake-fairshare-speedtest.service
 WantedBy=timers.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now cake-fairshare-speedtest.timer >/dev/null 2>&1
+  if [ "$do_enable" != "0" ]; then
+    systemctl enable --now cake-fairshare-speedtest.timer >/dev/null 2>&1
+  fi
 }
 
 # ---------------------------------------------------------------- 在线升级 ----
@@ -2100,9 +2105,11 @@ sync_units() {
     if install_daily_timer >/dev/null 2>&1; then changed="${changed} 每日日报"; fi
   fi
   if [ -f "${SPEEDTEST_UNIT%.service}.timer" ]; then
+    # 只在"测速定时器本来就在运行"时同步模板；用 0 参数不启用，
+    # 避免升级把用户没开的自动测速擅自打开（3.6.10 起默认就是关的）。
     if ! grep -qs 'Environment=HOME=' "$SPEEDTEST_UNIT" \
       || ! grep -qs '00,30' "${SPEEDTEST_UNIT%.service}.timer"; then
-      if install_speedtest_timer >/dev/null 2>&1; then changed="${changed} 自动测速"; fi
+      if install_speedtest_timer 0 >/dev/null 2>&1; then changed="${changed} 自动测速模板"; fi
     fi
   fi
   if [ -n "$changed" ]; then
@@ -2273,7 +2280,8 @@ menu_log() {
   local act n
   say ""
   say "  采样日志：每分钟记录一次上行/下行实速与队列统计，用于事后判断是否被平台限速"
-  say "  自动测速：每小时 :00 与 :30 各检查一次，链路空闲才跑，一小时最多一条记录"
+  say "  自动测速：默认关闭。开启后每小时 :00 与 :30 各检查一次，链路空闲才跑，"
+  say "            一小时最多一条记录；单次会消耗几十到几百 MB 流量（900M 机器约 800MB）"
   hr
   say "  1) 开启每分钟采样"
   say "  2) 关闭采样"
