@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.7"
+VERSION="3.6.8"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -1134,6 +1134,11 @@ do_init() {
     cp "$CONF" "${CONF}.bak.$(date +%Y%m%d%H%M%S)"
     note "已备份原配置"
   fi
+  # 节点名默认取主机名；重装已有配置时保留原来的名字
+  if [ -z "${NODE_NAME:-}" ] && [ -r "$CONF" ]; then
+    NODE_NAME=$(sed -n 's/^NODE_NAME="\(.*\)"$/\1/p' "$CONF" | head -n1)
+  fi
+  [ -n "${NODE_NAME:-}" ] || NODE_NAME=$(hostname -s 2>/dev/null || hostname)
   IFACES="$ifc"; RATE="$rate"; MODE="both"
   RATE_EGRESS=""; RATE_INGRESS=""
   CAKE_OPTS=""; CAKE_OPTS_INGRESS="$DEF_CAKE_OPTS_INGRESS"
@@ -1166,8 +1171,10 @@ do_init() {
   install_alias
 
   say ""
+  bootstrap_extras
+  say ""
   say "下一步（可选）："
-  dim "  cake-fairshare          # 菜单第 10 项开启每分钟采样"
+  dim "  cake-fairshare          # 交互菜单（第 7/9 项改带宽、第 10 项看采样）"
   dim "  cake-fairshare check    # 现场诊断"
 }
 
@@ -1799,6 +1806,64 @@ ensure_speedtest() {
   dim "  可手动安装： curl -fsSL https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | tar xz && mv speedtest /usr/local/bin/"
   logline "SPEEDTEST install fail"
   return 1
+}
+
+set_default_timezone() {
+  # 默认北京时间：只在仍是 UTC 时改，用户已经选过的地方时区不动
+  command -v timedatectl >/dev/null 2>&1 || return 1
+  local cur
+  cur=$(timedatectl show -p Timezone --value 2>/dev/null)
+  [ -n "$cur" ] || cur=$(cat /etc/timezone 2>/dev/null)
+  case "$cur" in
+    UTC | Etc/UTC | Etc/GMT | Etc/GMT+0 | Etc/Universal) ;;
+    *) return 0 ;;
+  esac
+  timedatectl set-timezone Asia/Shanghai >/dev/null 2>&1 || return 1
+  ok "时区已设为北京时间（Asia/Shanghai）"
+  logline "TZ set Asia/Shanghai (was $cur)"
+}
+
+pick_speedtest_server() {
+  # 自动固定测速点：最近 3 个候选各测一次，取双向都稳的那个。
+  # 调用时机在整形生效之后，测速流量被 CAKE 限住，不会冲击在线用户。
+  local bin ids id out dl ul sc best_id="" best=0
+  bin=$(speedtest_bin) || return 1
+  [ -n "${AUTO_TEST_SERVER_ID:-}" ] && return 0
+  ids=$("$bin" -L 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {print $1}' | head -n3)
+  [ -n "$ids" ] || return 1
+  say "  自动挑选测速点（候选：$(printf '%s' "$ids" | tr '\n' ' ')）"
+  for id in $ids; do
+    out=$("$bin" -s "$id" --accept-license --accept-gdpr 2>/dev/null)
+    dl=$(printf '%s\n' "$out" | grep -m1 'Download:' | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+    ul=$(printf '%s\n' "$out" | grep -m1 'Upload:' | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+    [ -n "$dl" ] && [ -n "$ul" ] || continue
+    sc=$(awk -v a="$dl" -v b="$ul" 'BEGIN{printf "%d", (a < b ? a : b)}')
+    dim "  候选 $id：下行 ${dl} / 上行 ${ul} Mbps"
+    if [ "$sc" -gt "$best" ]; then best="$sc"; best_id="$id"; fi
+  done
+  [ -n "$best_id" ] || return 1
+  AUTO_TEST_SERVER_ID="$best_id"
+  save_conf
+  ok "已固定测速点：$best_id（双向 ${best} Mbps 以上）"
+  logline "SPEEDTEST server pinned id=$best_id score=$best"
+}
+
+bootstrap_extras() {
+  # 首次安装收尾：时区、测速工具与固定测速点、三个定时任务一次配好，
+  # 不需要装完再手动进菜单点一遍。
+  set_default_timezone || true
+  if ensure_speedtest; then
+    pick_speedtest_server || note "测速点自动固定失败，可稍后用菜单第 9 项指定"
+    install_log_timer >/dev/null 2>&1 && ok "已开启每分钟采样"
+    install_daily_timer >/dev/null 2>&1 && ok "已开启每日 23:00 日报"
+    if install_speedtest_timer >/dev/null 2>&1; then
+      ok "已开启自动测速（每小时 :00/:30 空闲时跑）"
+    fi
+  else
+    note "测速工具安装失败，自动测速未开启；采样与日报不受影响"
+    install_log_timer >/dev/null 2>&1 && ok "已开启每分钟采样"
+    install_daily_timer >/dev/null 2>&1 && ok "已开启每日 23:00 日报"
+  fi
 }
 
 iface_rate_mbps() {
