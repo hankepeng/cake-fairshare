@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.11"
+VERSION="3.6.12"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -127,6 +127,7 @@ load_conf() {
   RATE_EGRESS=""; RATE_INGRESS=""
   CAKE_OPTS=""; CAKE_OPTS_INGRESS="$DEF_CAKE_OPTS_INGRESS"
   AUTO_TEST_IDLE_PCT="15"; AUTO_TEST_MAXWAIT="900"; AUTO_TEST_SERVER_ID=""
+  QUOTA_GB=""
   # shellcheck disable=SC1090
   if [ -r "$CONF" ]; then . "$CONF"; fi
 }
@@ -158,6 +159,8 @@ save_conf() {
     printf '# 固定测速服务器 id（speedtest -L 查看）；留空则每次自动选最近的，\n'
     printf '# 填了才能让每次数据可比（自动选会换服务器，速度差异很大）\n'
     printf 'AUTO_TEST_SERVER_ID="%s"\n' "${AUTO_TEST_SERVER_ID:-}"
+    printf '# 套餐月流量上限（GB，留空则不提醒）；用于健康报告的用量预估\n'
+    printf 'QUOTA_GB="%s"\n' "${QUOTA_GB:-}"
   } >"$CONF"
 }
 
@@ -1469,46 +1472,119 @@ diagnose() {
 show_speedtest_history() {
   local dir="${SPEEDTEST_DIR:-/root/speedtest_history}"
   [ -d "$dir" ] || return 0
-  local files f ts dl ul maxdl base_files
-  files=$(ls -1t "$dir"/* 2>/dev/null | head -12 | sort)
+  local files f ts dl ul maxdl maxul judge hh tag total tag_peak
+  total=$(ls -1 "$dir"/speedtest_* 2>/dev/null | wc -l | tr -d ' ')
+  [ "${total:-0}" -gt 0 ] || return 0
+  files=$(ls -1t "$dir"/speedtest_* 2>/dev/null | head -12 | sort)
   [ -n "$files" ] || return 0
-  # 基准用最近 60 条来算，只显示最近 12 条。
-  # 否则每小时自动测速后，一旦连续掉速十几次，显示的那 12 条全是低值，
-  # 基准会被算成低值，反而把"异常"判成"正常"。
-  base_files=$(ls -1t "$dir"/* 2>/dev/null | head -60)
-
-  local maxdl=0 maxul=0
-  for f in $base_files; do
-    dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
-    ul=$(grep -m1 'Upload:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
-    [ -n "$dl" ] || continue
-    maxdl=$(awk -v a="$maxdl" -v b="$dl" 'BEGIN{print (b>a)?b:a}')
-    [ -n "$ul" ] && maxul=$(awk -v a="$maxul" -v b="$ul" 'BEGIN{print (b>a)?b:a}')
-  done
+  read -r maxdl maxul <<<"$(speedtest_baseline "$dir")"
   awk -v m="$maxdl" 'BEGIN{exit !(m > 0)}' || return 0
 
-  ST_ALERTS=0
+  ST_ALERTS=0; ST_PEAK_LOWS=0; ST_RECORDS=$total
   say ""
   say "  ${B}历史测速记录${R} ${D}（$dir   基准：下行 ${maxdl} / 上行 ${maxul} Mbps）${R}"
   for f in $files; do
     ts=$(head -1 "$f" 2>/dev/null)
-    dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
-    ul=$(grep -m1 'Upload:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+    ul=$(grep -m1 'Upload:' "$f" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
     [ -n "$dl" ] || continue
+    # 测速记录里带 # judge=（新版才会写）：recovered/mild/low-all
+    judge=$(grep -m1 '^# judge=' "$f" 2>/dev/null | sed 's/^# judge=//; s/ .*//')
     tag=""
-    if awk -v v="$dl" -v m="$maxdl" 'BEGIN{exit !(v < m*0.3)}'; then
-      tag="  <- 下行异常偏低"
+    case "$judge" in
+      low-all) tag="偏低（多点复核仍低）" ;;
+      mild) tag="偏低" ;;
+    esac
+    if [ -z "$judge" ]; then
+      # 旧记录没有 judge 字段，按历史基准 30% 的旧规则兜底
+      if awk -v v="$dl" -v m="$maxdl" 'BEGIN{exit !(v < m*0.3)}'; then
+        tag="下行异常偏低"
+      fi
+      if [ -n "$ul" ] && awk -v v="$ul" -v m="$maxul" 'BEGIN{exit !(v < m*0.3)}'; then
+        if [ -n "$tag" ]; then tag="上下行都异常偏低"; else tag="上行异常偏低"; fi
+      fi
     fi
-    if [ -n "$ul" ] && awk -v v="$ul" -v m="$maxul" 'BEGIN{exit !(v < m*0.3)}'; then
-      if [ -n "$tag" ]; then tag="  <- 上下行都异常偏低"; else tag="  <- 上行异常偏低"; fi
-    fi
-    [ -n "$tag" ] && ST_ALERTS=$((ST_ALERTS + 1))
+    # 20:00~01:00 是国际链路高峰，这个时段的偏低多为正常波动，跟平峰偏低分开统计
+    hh="${ts: -5:2}"
+    case "$hh" in
+      19 | 20 | 21 | 22 | 23 | 00) tag_peak=1 ;;
+      *) tag_peak=0 ;;
+    esac
     if [ -n "$tag" ]; then
+      if [ "$tag_peak" = "1" ]; then
+        tag="高峰偏低（常见波动）"
+        ST_PEAK_LOWS=$((ST_PEAK_LOWS + 1))
+      else
+        ST_ALERTS=$((ST_ALERTS + 1))
+      fi
       printf '    %-18s 下行 %7s   上行 %7s Mbps   %b%s%b\n' "$ts" "$dl" "${ul:-?}" "$Y" "$tag" "$R"
     else
       printf '    %-18s 下行 %7s   上行 %7s Mbps\n' "$ts" "$dl" "${ul:-?}"
     fi
   done
+}
+
+show_traffic_estimate() {
+  # 按采样日志估算本月流量：样本里是 Mbps，间隔约 60 秒
+  load_conf
+  [ -r "$SAMPLE_LOG" ] || return 0
+  local month first last used
+  month=$(date '+%Y-%m')
+  first=""; last=""; used=0
+  IFS='|' read -r first last used <<<"$(awk -F, -v m="$month" '
+    index($1, m) == 1 {
+      used += ($2 + $3) * 60 / 8 / 1024
+      if (first == "") first = $1
+      last = $1
+    }
+    END { if (used > 0.05) printf "%s|%s|%.2f\n", first, last, used }' "$SAMPLE_LOG")"
+  [ -n "${used:-}" ] && awk -v u="$used" 'BEGIN{exit !(u > 0.05)}' || return 0
+
+  local t0 t1 hours days total_days today remain daily proj quota
+  t0=$(date -d "$first" +%s 2>/dev/null) || return 0
+  t1=$(date -d "$last" +%s 2>/dev/null) || return 0
+  hours=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", (b-a)/3600}')
+  # 样本覆盖不到 3 小时就外推"日均/月底"会离谱（1 小时 × 24 倍），只报已用
+  if awk -v h="$hours" 'BEGIN{exit !(h < 3)}'; then
+    say ""
+    say "  ${B}本月流量估算${R} ${D}（采样 ${first} 起，出+入合计）${R}"
+    printf '  已用 %.1f GB（覆盖 %.1f 小时；不足 3 小时，暂不推算月底）\n' "$used" "$hours"
+    return 0
+  fi
+  days=$(awk -v h="$hours" 'BEGIN{printf "%.2f", h/24}')
+  daily=$(awk -v u="$used" -v d="$days" 'BEGIN{printf "%.2f", u/d}')
+  total_days=$(date -d "$month-01 +1 month -1 day" '+%d' 2>/dev/null || echo 30)
+  today=$(date '+%-d')
+  remain=$((total_days - today))
+  [ "$remain" -lt 0 ] && remain=0
+  proj=$(awk -v u="$used" -v d="$daily" -v r="$remain" 'BEGIN{printf "%.0f", u + d*r}')
+  quota="${QUOTA_GB:-}"
+  # 配置里填了非数字（如 "1TB"）时按未设置处理，避免 awk 除零把报告写坏
+  case "$quota" in '' | *[!0-9.]*) quota="" ;; esac
+  awk -v q="$quota" 'BEGIN{exit !(q+0 > 0)}' || quota=""
+  # 覆盖不足 24 小时时，日均样本偏差大，不给月底预测和超量告警
+  local enough=1
+  awk -v h="$hours" 'BEGIN{exit !(h < 24)}' && enough=0
+
+  say ""
+  say "  ${B}本月流量估算${R} ${D}（采样 ${first} 起，出+入合计）${R}"
+  if [ -n "$quota" ]; then
+    printf '  已用 %.1f GB / 套餐 %s GB（%.0f%%）   日均 %.1f GB' \
+      "$used" "$quota" "$(awk -v u="$used" -v q="$quota" 'BEGIN{printf "%.0f", u*100/q}')" "$daily"
+    if [ "$enough" = "1" ]; then
+      printf '，预计月底 %.0f GB\n' "$proj"
+      if awk -v p="$proj" -v q="$quota" 'BEGIN{exit !(p > q*0.9)}'; then
+        note "按当前速率月底会接近/超过套餐（预计 ${proj} / ${quota} GB），建议分流或调低上限"
+      fi
+    else
+      printf '（覆盖 %.1f 小时，不足 24 小时，暂不推算月底）\n' "$hours"
+    fi
+  else
+    printf '  已用 %.1f GB   日均 %.1f GB' "$used" "$daily"
+    if [ "$enough" = "1" ]; then printf '，预计月底 %.0f GB\n' "$proj"; else printf '（覆盖 %.1f 小时，暂不推算月底）\n' "$hours"; fi
+    dim "  想按套餐提醒：在 /etc/cake-fairshare/config 里设 QUOTA_GB=1024 这类上限"
+  fi
+  dim "  依据是每分钟采样；若中途重启采样 timer，统计会以已有样本为准"
 }
 
 health_report() {
@@ -1561,6 +1637,21 @@ health_report() {
       if ($15 + 0 > mibk) mibk = $15 + 0
       first = (first == "" ? ts : first)
       last = ts
+      # 连续饱和检测：样本每分钟 1 条，连续 30 条 ≥90% 即持续饱和半小时
+      if (ce > 0) {
+        if (tx >= ce * 0.9) {
+          erun++
+          if (erun == 1) erun_t = ts
+          if (erun > ermax) { ermax = erun; ermax_t = erun_t; ermax_v = tx }
+        } else erun = 0
+      }
+      if (ci > 0) {
+        if (rx >= ci * 0.9) {
+          irun++
+          if (irun == 1) irun_t = ts
+          if (irun > irmax) { irmax = irun; irmax_t = irun_t; irmax_v = rx }
+        } else irun = 0
+      }
     }
     END {
       printf "  %-13s %6s %8s %10s %10s %10s\n", "时段", "样本", "连接峰值", "下行峰值", "下行均值", "上行均值"
@@ -1581,6 +1672,13 @@ health_report() {
         printf "  %s\n", "→ 队列从未被填满：上限比实际需求宽，不会成为瓶颈（也就没有提速空间被浪费）"
       else if (mebk > 0 || mibk > 0)
         printf "  %s\n", "→ 出现过排队：上限确实在起作用，公平分配已生效"
+
+      # 连续半小时以上贴着上限，才是"需要分流/提额"的信号；
+      # 单条样本冲高不算，避免晚高峰一次突发就报警。
+      if (ermax >= 30)
+        printf "  %s\n", "→ 饱和告警：出口自 " substr(ermax_t, 6, 11) " 起连续 " ermax " 分钟 ≥90%（峰值 " sprintf("%.1f", ermax_v) " / " sprintf("%.1f", ce) " Mbps），建议分流或临时提高上限"
+      if (irmax >= 30)
+        printf "  %s\n", "→ 饱和告警：入口自 " substr(irmax_t, 6, 11) " 起连续 " irmax " 分钟 ≥90%（峰值 " sprintf("%.1f", irmax_v) " / " sprintf("%.1f", ci) " Mbps）"
 
       if (gmax < ce * 0.5 && mebk <= 0)
         printf "  %s\n", "提示：峰值不到上限一半且从不排队，说明这台机器当前用不满这个带宽"
@@ -1605,15 +1703,25 @@ health_report() {
   ' "$SAMPLE_LOG"
   hr
 
+  ST_ALERTS=0; ST_PEAK_LOWS=0; ST_RECORDS=0
   show_speedtest_history
+  show_traffic_estimate
 
   say ""
   hr
-  if [ "${ST_ALERTS:-0}" -eq 0 ]; then
-    ok "历史测速未发现异常，带宽表现正常"
+  if [ "${ST_RECORDS:-0}" -lt 5 ]; then
+    note "测速记录只有 ${ST_RECORDS:-0} 条，样本不足，暂不判定是否被限速"
+    dim "  开启自动测速（菜单 9，每 4 小时一次）或手动多测几次后再看"
+  elif [ "${ST_ALERTS:-0}" -eq 0 ]; then
+    if [ "${ST_PEAK_LOWS:-0}" -gt 0 ]; then
+      ok "平峰测速正常；${ST_PEAK_LOWS} 次高峰（19:00~01:00）偏低属常见波动"
+    else
+      ok "历史测速未发现异常，带宽表现正常"
+    fi
   else
     note "历史测速中有 ${ST_ALERTS} 次明显偏低（已用黄色标出），其余时间正常"
     dim "  短暂一两次通常是上游抖动或当时本机流量占满；频繁出现才需要考虑换线路或找服务商"
+    [ "${ST_PEAK_LOWS:-0}" -gt 0 ] && dim "另有 ${ST_PEAK_LOWS} 次落在高峰时段，按常见波动统计，未计入异常"
   fi
   dim "  说明：采样是「实际用量」，空闲时速度当然是 0，用量低不等于被限速。"
   dim "        采样也看不出上游是否在限速——被云网关丢掉的包，系统里根本看不到。"
@@ -1844,8 +1952,8 @@ pick_speedtest_server() {
   say "  自动挑选测速点（候选：$(printf '%s' "$ids" | tr '\n' ' ')）"
   for id in $ids; do
     out=$("$bin" -s "$id" --accept-license --accept-gdpr 2>/dev/null)
-    dl=$(printf '%s\n' "$out" | grep -m1 'Download:' | grep -oE '[0-9]+\.[0-9]+' | head -n1)
-    ul=$(printf '%s\n' "$out" | grep -m1 'Upload:' | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+    dl=$(printf '%s\n' "$out" | grep -m1 'Download:' | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)
+    ul=$(printf '%s\n' "$out" | grep -m1 'Upload:' | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)
     [ -n "$dl" ] && [ -n "$ul" ] || continue
     sc=$(awk -v a="$dl" -v b="$ul" 'BEGIN{printf "%d", (a < b ? a : b)}')
     dim "  候选 $id：下行 ${dl} / 上行 ${ul} Mbps"
@@ -1900,12 +2008,40 @@ hour_has_record() {
   return 1
 }
 
+speedtest_baseline() {
+  # 历史基准：最近 60 条里的最高下行/上行。
+  # 用最大值而不是均值，避免连续掉速后把基准也拉低、反而判成"正常"。
+  local dir="$1" f dl ul maxdl=0 maxul=0
+  for f in $(ls -1t "$dir"/speedtest_* 2>/dev/null | head -60); do
+    dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+    [ -n "$dl" ] || continue
+    ul=$(grep -m1 'Upload:' "$f" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+    maxdl=$(awk -v a="$maxdl" -v b="$dl" 'BEGIN{print (b>a)?b:a}')
+    if [ -n "$ul" ]; then maxul=$(awk -v a="$maxul" -v b="$ul" 'BEGIN{print (b>a)?b:a}'); fi
+  done
+  printf '%s %s\n' "$maxdl" "$maxul"
+}
+
+speedtest_try() {
+  # 指定测速点跑一次，完整输出写到 $4，成功时输出 "下行 上行"
+  local bin="$1" sid="$2" home_dir="$3" outf="$4" opt dl ul
+  opt="--accept-license --accept-gdpr"
+  [ -n "$sid" ] && opt="$opt --server-id=$sid"
+  # shellcheck disable=SC2086
+  HOME="$home_dir" "$bin" $opt >"$outf" 2>&1 || return 1
+  dl=$(grep -m1 'Download:' "$outf" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+  ul=$(grep -m1 'Upload:' "$outf" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+  [ -n "$dl" ] || return 1
+  printf '%s %s\n' "$dl" "${ul:-0}"
+}
+
 record_speedtest() {
   # 跑一次测速并写入历史目录（供「带宽健康报告」读取）。
   # $1 = auto 时先等链路空闲，避免在晚高峰跟用户抢带宽。
   load_conf
   require_root
   local bin mode="${1:-now}" ifc dir ts f out dl ul waited=0 pct maxwait mb_in mb_out cap_e cap_i d
+  local base_dl=0 base_ul=0 judge="" retested=0 tmp_out best_dl best_ul best_out best_score ref_score sid sid_used d u d_score
   ensure_speedtest || return 1
   bin=$SPEEDTEST_BIN_PATH
   ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
@@ -1982,16 +2118,76 @@ record_speedtest() {
     fi
   fi
 
+  dl=$(printf '%s' "$out" | grep -m1 'Download:' | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+  ul=$(printf '%s' "$out" | grep -m1 'Upload:' | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+  if [ -z "$dl" ]; then
+    logline "SPEEDTEST fail no-result"
+    bad "测速没有返回结果"
+    printf '%s\n' "$out" | head -4 | sed 's/^/    /'
+    return 1
+  fi
+
+  # 防误判：单个测速点自身路由拥塞时，会把「测速点问题」记成「线路偏低」。
+  # 结果低于历史基准 30% 就换 2 个备用测速点复核，取最好的一次写记录。
+  # 实测新加坡4 出现 1.3 Mbps，而同机四流实测 149 Mbps 的误报就是这样来的。
+  # 注意：复核前不落盘。否则复核要 30 秒，会先留下一条偏低记录，
+  # 之后又写一条正常记录，历史里两条并存，偏低那条会污染健康报告。
+  read -r base_dl base_ul <<<"$(speedtest_baseline "$dir")"
+  best_dl="$dl"; best_ul="${ul:-0}"; best_out="$out"
+  best_score=$(awk -v a="$best_dl" -v b="$best_ul" 'BEGIN{printf "%.2f", (b+0>0 && b<a)?b:a}')
+  sid_used="${AUTO_TEST_SERVER_ID:-}"
+  if [ "$(basename "$bin")" = "speedtest" ] && awk -v d="$dl" -v u="${ul:-0}" -v bd="$base_dl" -v bu="$base_ul" \
+    'BEGIN{exit !((bd+0>0 && d+0 < bd*0.3) || (bu+0>0 && u+0 < bu*0.3))}'; then
+    say "  首次结果偏低（历史基准 下行 ${base_dl} / 上行 ${base_ul} Mbps），换测速点复核..."
+    tmp_out="$dir/.retest.$$"
+    sid=$("$bin" -L 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {print $1}' | head -n 8)
+    for sid in $sid; do
+      [ "$sid" = "$sid_used" ] && continue
+      [ "$retested" -ge 2 ] && break
+      retested=$((retested + 1))
+      if read -r d u <<<"$(speedtest_try "$bin" "$sid" "$home_dir" "$tmp_out")"; then
+        dim "  复核 $sid：下行 $d / 上行 $u Mbps"
+        d_score=$(awk -v a="$d" -v b="$u" 'BEGIN{printf "%.2f", (b+0>0 && b<a)?b:a}')
+        if awk -v s="$d_score" -v m="$best_score" 'BEGIN{exit !(s > m)}'; then
+          best_dl="$d"; best_ul="$u"; best_score="$d_score"; best_out=$(cat "$tmp_out")
+        fi
+      fi
+    done
+    rm -f "$tmp_out"
+    # 复核后仍低才算「多点都低」，否则按测速点问题处理，取复核到的正常值写记录
+    ref_score=$(awk -v a="$base_dl" -v b="$base_ul" 'BEGIN{
+      if (a+0>0 && b+0>0) printf "%.2f", (a<b)?a:b; else printf "%.2f", (a+0>0)?a:b
+    }')
+    if awk -v s="$best_score" -v r="$ref_score" 'BEGIN{exit !(r>0 && s >= r*0.7)}'; then
+      judge="recovered"
+      dl="$best_dl"; ul="$best_ul"; out="$best_out"
+      ok "复核恢复正常：下行 ${dl} / 上行 ${ul} Mbps（测速点问题，非线路限速）"
+    elif awk -v s="$best_score" -v r="$ref_score" 'BEGIN{exit !(r>0 && s >= r*0.3)}'; then
+      judge="mild"
+      dl="$best_dl"; ul="$best_ul"; out="$best_out"
+    else
+      judge="low-all"
+      dl="$best_dl"; ul="$best_ul"; out="$best_out"
+      note "复核仍偏低：${retested} 个测速点都不理想（最低 ${best_score} Mbps）"
+    fi
+  fi
+
   ts=$(date '+%Y%m%d_%H%M%S')
   f="$dir/speedtest_${ts}.txt"
-  { date '+%Y/%m/%d %H:%M'; printf '%s\n' "$out"; } >"$f"
-  # 只留最近 240 条（每小时一条约 10 天）
+  {
+    date '+%Y/%m/%d %H:%M'
+    printf '%s\n' "$out"
+    [ -n "$judge" ] && printf '# judge=%s retested=%d\n' "$judge" "$retested"
+  } >"$f"
+  # 只留最近 240 条（每 4 小时一条约 40 天）
   ls -1t "$dir"/speedtest_* 2>/dev/null | tail -n +241 | while read -r d; do rm -f "$d"; done
 
-  dl=$(printf '%s' "$out" | grep -m1 'Download:' | grep -oE '[0-9]+\.[0-9]+' | head -1)
-  ul=$(printf '%s' "$out" | grep -m1 'Upload:' | grep -oE '[0-9]+\.[0-9]+' | head -1)
-  logline "SPEEDTEST ok dl=${dl:-?} ul=${ul:-?} file=$f"
-  ok "已记录：下行 ${dl:-?} / 上行 ${ul:-?} Mbps"
+  logline "SPEEDTEST ok dl=${dl:-?} ul=${ul:-?} judge=${judge:-ok} retested=$retested file=$f"
+  if [ "$judge" = "recovered" ]; then
+    ok "已记录：下行 ${dl} / 上行 ${ul} Mbps（已换点复核，原测速点偏低）"
+  else
+    ok "已记录：下行 ${dl} / 上行 ${ul} Mbps"
+  fi
   dim "  文件：$f"
 }
 
@@ -2379,8 +2575,8 @@ speedtest_peaks() {
   local dir="${SPEEDTEST_DIR:-/root/speedtest_history}" f dl ul mxd=0 mxu=0 n=0
   if [ -d "$dir" ]; then
     for f in $(ls -1t "$dir"/* 2>/dev/null | head -n 30); do
-      dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n1)
-      ul=$(grep -m1 'Upload:' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+      dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)
+      ul=$(grep -m1 'Upload:' "$f" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)
       [ -n "$dl" ] || continue
       n=$((n + 1))
       mxd=$(awk -v a="$mxd" -v b="$dl" 'BEGIN{print (b > a) ? b : a}')
