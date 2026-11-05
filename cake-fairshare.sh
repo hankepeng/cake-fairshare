@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.10"
+VERSION="3.6.11"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -1890,8 +1890,8 @@ iface_rate_mbps() {
 }
 
 hour_has_record() {
-  # 本小时是否已有测速记录。定时器在 :00 和 :30 各触发一次，
-  # 整点成功就够本小时的了，半点那次靠这个跳过，避免一小时两条重复数据。
+  # 本小时是否已有测速记录。定时器每 4 小时触发一次，
+  # 这里保留按小时去重，防止手动重跑定时器时在同一小时内重复写记录。
   local dir="$1" cur f
   cur=$(date '+%Y%m%d_%H')
   for f in "$dir"/speedtest_"$cur"*; do
@@ -1917,12 +1917,12 @@ record_speedtest() {
     pct="${AUTO_TEST_IDLE_PCT:-15}"
     maxwait="${AUTO_TEST_MAXWAIT:-900}"
     case "$maxwait" in '' | *[!0-9]*) maxwait=900 ;; esac
-    # 上限 25 分钟：定时器 :00 和 :30 各触发一次，等太久会和下一次撞车
+    # 上限 25 分钟：每 4 小时才触发一次，但别让等待无限拉长占住定时器
     [ "$maxwait" -le 1500 ] 2>/dev/null || maxwait=1500
     case "$pct" in '' | *[!0-9]*) pct=15 ;; esac
     [ "$pct" -le 100 ] 2>/dev/null || pct=100
 
-    # 本小时已经测过就不再测（:00 成功 → :30 自动跳过）
+    # 本小时已经测过就不再测（防同一小时内重复写记录）
     if hour_has_record "$dir"; then
       logline "SPEEDTEST skip already-done-this-hour"
       say "  本小时已有测速记录，跳过"
@@ -2015,10 +2015,10 @@ Nice=10
 EOF
   cat >"${SPEEDTEST_UNIT%.service}.timer" <<'EOF'
 [Unit]
-Description=Speedtest twice an hour (:00 and :30), runs only when the link is idle
+Description=Speedtest every 4 hours (00/04/08/12/16/20), runs only when the link is idle
 
 [Timer]
-OnCalendar=*-*-* *:00,30:00
+OnCalendar=*-*-* 00/4:00:00
 AccuracySec=10s
 Persistent=false
 Unit=cake-fairshare-speedtest.service
@@ -2108,7 +2108,7 @@ sync_units() {
     # 只在"测速定时器本来就在运行"时同步模板；用 0 参数不启用，
     # 避免升级把用户没开的自动测速擅自打开（3.6.10 起默认就是关的）。
     if ! grep -qs 'Environment=HOME=' "$SPEEDTEST_UNIT" \
-      || ! grep -qs '00,30' "${SPEEDTEST_UNIT%.service}.timer"; then
+      || ! grep -qs '00/4' "${SPEEDTEST_UNIT%.service}.timer"; then
       if install_speedtest_timer 0 >/dev/null 2>&1; then changed="${changed} 自动测速模板"; fi
     fi
   fi
@@ -2280,8 +2280,8 @@ menu_log() {
   local act n
   say ""
   say "  采样日志：每分钟记录一次上行/下行实速与队列统计，用于事后判断是否被平台限速"
-  say "  自动测速：默认关闭。开启后每小时 :00 与 :30 各检查一次，链路空闲才跑，"
-  say "            一小时最多一条记录；单次会消耗几十到几百 MB 流量（900M 机器约 800MB）"
+  say "  自动测速：默认关闭。开启后每 4 小时检查一次（00/04/08/12/16/20 点），链路空闲才跑，"
+  say "            单次会消耗几十到几百 MB 流量（900M 机器约 800MB）"
   hr
   say "  1) 开启每分钟采样"
   say "  2) 关闭采样"
@@ -2291,7 +2291,7 @@ menu_log() {
   say "  6) 开启每天 23:00 自动日报"
   say "  7) 关闭自动日报"
   say "  8) 查看日报"
-  say "  9) 开启自动测速（每小时 :00/:30 空闲时跑，忙则跳过）"
+  say "  9) 开启自动测速（每 4 小时空闲时跑，忙则跳过）"
   say " 10) 关闭自动测速"
   say " 11) 立即测速一次（马上跑，不等空闲）"
   read -rp "选择 [默认 1]: " act
@@ -2339,7 +2339,7 @@ menu_log() {
       ;;
     9)
       if install_speedtest_timer; then
-        ok "已开启：每小时 :00 与 :30 各检查一次，链路空闲才测速"
+        ok "已开启：每 4 小时检查一次（00/04/08/12/16/20 点），链路空闲才测速"
         dim "  查看： systemctl list-timers cake-fairshare-speedtest.timer"
         dim "  若整点链路正忙，最多等 $(( ${AUTO_TEST_MAXWAIT:-900} / 60 )) 分钟后跳过，不会跟用户抢带宽"
       else
