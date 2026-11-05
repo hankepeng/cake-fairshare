@@ -1711,7 +1711,7 @@ health_report() {
   hr
   if [ "${ST_RECORDS:-0}" -lt 5 ]; then
     note "测速记录只有 ${ST_RECORDS:-0} 条，样本不足，暂不判定是否被限速"
-    dim "  开启自动测速（菜单 9，每 4 小时一次）或手动多测几次后再看"
+    dim "  开启自动测速（菜单 10 → 9，每 4 小时一次）或手动多测几次后再看"
   elif [ "${ST_ALERTS:-0}" -eq 0 ]; then
     if [ "${ST_PEAK_LOWS:-0}" -gt 0 ]; then
       ok "平峰测速正常；${ST_PEAK_LOWS} 次高峰（19:00~01:00）偏低属常见波动"
@@ -1972,16 +1972,16 @@ bootstrap_extras() {
   # 常驻每小时跑会持续吃掉套餐流量，交给用户按需在菜单里开。
   set_default_timezone || true
   if ensure_speedtest; then
-    pick_speedtest_server || note "测速点自动固定失败，可稍后用菜单第 9 项指定"
+    pick_speedtest_server || note "测速点自动固定失败，可稍后编辑 $CONF 指定 AUTO_TEST_SERVER_ID"
     install_log_timer >/dev/null 2>&1 && ok "已开启每分钟采样"
     install_daily_timer >/dev/null 2>&1 && ok "已开启每日 23:00 日报"
     note "自动测速默认关闭（每次约几十到几百 MB，避免长期占用套餐流量）"
-    dim "  需要时： cake → 功能开关 → 9) 开启自动测速"
+    dim "  需要时： cake → 10) 采样日志与现场诊断 → 9) 开启自动测速"
   else
     note "测速工具安装失败；采样与日报不受影响"
     install_log_timer >/dev/null 2>&1 && ok "已开启每分钟采样"
     install_daily_timer >/dev/null 2>&1 && ok "已开启每日 23:00 日报"
-    dim "  装好测速工具后： cake → 功能开关 → 9) 开启自动测速"
+    dim "  装好测速工具后： cake → 10) 采样日志与现场诊断 → 9) 开启自动测速"
   fi
 }
 
