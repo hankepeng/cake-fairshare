@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.8"
+VERSION="3.6.9"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -1088,17 +1088,27 @@ detect_existing_rate() {
   # 用途：init 时如果用户没指定带宽，沿用它而不是套默认值——
   # 否则在一台已经限速 168/180 的机器上直接套 190，会改变现有速度。
   local ifc="$1" eg="" in="" d ifb=""
-  eg=$(tc -s class show dev "$ifc" 2>/dev/null \
-    | awk '/^class /{for (i = 1; i <= NF; i++) if ($i == "rate") {print $(i+1); exit}}')
+  # 根队列已经是 cake 时，带宽只能从 qdisc 的 bandwidth 字段读出来
+  eg=$(tc qdisc show dev "$ifc" 2>/dev/null | head -n1 \
+    | awk '{for (i = 1; i <= NF; i++) if ($i == "bandwidth") {print $(i+1); exit}}')
   for d in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^ifb[0-9]+$/ {print $2}'); do
     ifb="$d"
     break
   done
   if [ -n "$ifb" ]; then
+    in=$(tc qdisc show dev "$ifb" 2>/dev/null | head -n1 \
+      | awk '{for (i = 1; i <= NF; i++) if ($i == "bandwidth") {print $(i+1); exit}}')
+  fi
+  # 还没换成 cake（例如仍是一键脚本的 htb）时，才按 class 速率取
+  if [ -z "$eg" ]; then
+    eg=$(tc -s class show dev "$ifc" 2>/dev/null \
+      | awk '/^class /{for (i = 1; i <= NF; i++) if ($i == "rate") {print $(i+1); exit}}')
+  fi
+  if [ -z "$in" ] && [ -n "$ifb" ]; then
     in=$(tc -s class show dev "$ifb" 2>/dev/null \
       | awk '/^class /{for (i = 1; i <= NF; i++) if ($i == "rate") {print $(i+1); exit}}')
   fi
-  # 根队列已经是 cake 时上面取不到，退一步解析常见的一键限速脚本
+  # 根队列不是 cake 且取不到 class 速率时，退一步解析常见的一键限速脚本
   if [ -z "$eg" ] && [ -r /root/bandwidth-limit.sh ]; then
     eg=$(sed -n 's/^UP_MBPS="\([0-9][0-9]*\)".*/\1mbit/p' /root/bandwidth-limit.sh | head -n1)
     [ -z "$in" ] && in=$(sed -n 's/^DOWN_MBPS="\([0-9][0-9]*\)".*/\1mbit/p' /root/bandwidth-limit.sh | head -n1)

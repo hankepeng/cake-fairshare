@@ -1,5 +1,13 @@
 # Changelog
 
+## v3.6.9 — 2026-11-05
+
+### 修复
+
+- **`init` 在已是 cake 的机器上沿用了错误的旧速率**。`detect_existing_rate` 先读 `tc class`（cake 根队列没有 class，取不到值），随后回退去解析遗留的 `/root/bandwidth-limit.sh`，把已经废弃的旧 htb 数值（如 170/180）套回线上，覆盖掉正确的 190/190。
+  - 现在优先从 `tc qdisc show` 的 `bandwidth` 字段读出口/入口实际速率，只有队列还不是 cake 时才按 `class rate` 和旧脚本兜底。
+- 影响：在新加坡1（190mbit）上实测复现，重装后出口被误设为 170mbit；修复后沿用值正确。
+
 ## v3.6.8 — 2026-11-05
 
 ### 改进
