@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.12"
+VERSION="3.6.13"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -127,7 +127,7 @@ load_conf() {
   RATE_EGRESS=""; RATE_INGRESS=""
   CAKE_OPTS=""; CAKE_OPTS_INGRESS="$DEF_CAKE_OPTS_INGRESS"
   AUTO_TEST_IDLE_PCT="15"; AUTO_TEST_MAXWAIT="900"; AUTO_TEST_SERVER_ID=""
-  QUOTA_GB=""
+  QUOTA_GB=""; QUOTA_MODE="both"
   # shellcheck disable=SC1090
   if [ -r "$CONF" ]; then . "$CONF"; fi
 }
@@ -161,6 +161,8 @@ save_conf() {
     printf 'AUTO_TEST_SERVER_ID="%s"\n' "${AUTO_TEST_SERVER_ID:-}"
     printf '# 套餐月流量上限（GB，留空则不提醒）；用于健康报告的用量预估\n'
     printf 'QUOTA_GB="%s"\n' "${QUOTA_GB:-}"
+    printf '# 套餐计费方向：both=出+入都算；egress=只算服务器发出（AWS Lightsail 等）\n'
+    printf 'QUOTA_MODE="%s"\n' "${QUOTA_MODE:-both}"
   } >"$CONF"
 }
 
@@ -1525,20 +1527,29 @@ show_speedtest_history() {
 }
 
 show_traffic_estimate() {
-  # 按采样日志估算本月流量：样本里是 Mbps，间隔约 60 秒
+  # 按采样日志估算本月流量：样本里是 Mbps，timer 按分钟对齐，间隔即 60 秒
   load_conf
   [ -r "$SAMPLE_LOG" ] || return 0
-  local month first last used
+  local month first last used used_eg
   month=$(date '+%Y-%m')
-  first=""; last=""; used=0
-  IFS='|' read -r first last used <<<"$(awk -F, -v m="$month" '
+  first=""; last=""; used=0; used_eg=0
+  IFS='|' read -r first last used used_eg <<<"$(awk -F, -v m="$month" '
     index($1, m) == 1 {
-      used += ($2 + $3) * 60 / 8 / 1024
+      used    += ($2 + $3) * 60 / 8 / 1024
+      used_eg += $3 * 60 / 8 / 1024
       if (first == "") first = $1
       last = $1
     }
-    END { if (used > 0.05) printf "%s|%s|%.2f\n", first, last, used }' "$SAMPLE_LOG")"
+    END { if (used > 0.05) printf "%s|%s|%.2f|%.2f\n", first, last, used, used_eg }' "$SAMPLE_LOG")"
   [ -n "${used:-}" ] && awk -v u="$used" 'BEGIN{exit !(u > 0.05)}' || return 0
+
+  # 计费方向：Lightsail 这类只算服务器发出（$3 tx），按双向算会高估近一倍
+  local qmode label
+  case "${QUOTA_MODE:-both}" in
+    egress) qmode="egress"; label="仅出方向" ;;
+    *)      qmode="both";   label="出+入合计" ;;
+  esac
+  [ "$qmode" = "egress" ] && used="${used_eg:-0}"
 
   local t0 t1 hours days total_days today remain daily proj quota
   t0=$(date -d "$first" +%s 2>/dev/null) || return 0
@@ -1547,7 +1558,7 @@ show_traffic_estimate() {
   # 样本覆盖不到 3 小时就外推"日均/月底"会离谱（1 小时 × 24 倍），只报已用
   if awk -v h="$hours" 'BEGIN{exit !(h < 3)}'; then
     say ""
-    say "  ${B}本月流量估算${R} ${D}（采样 ${first} 起，出+入合计）${R}"
+    say "  ${B}本月流量估算${R} ${D}（采样 ${first} 起，${label}）${R}"
     printf '  已用 %.1f GB（覆盖 %.1f 小时；不足 3 小时，暂不推算月底）\n' "$used" "$hours"
     return 0
   fi
@@ -1567,7 +1578,7 @@ show_traffic_estimate() {
   awk -v h="$hours" 'BEGIN{exit !(h < 24)}' && enough=0
 
   say ""
-  say "  ${B}本月流量估算${R} ${D}（采样 ${first} 起，出+入合计）${R}"
+  say "  ${B}本月流量估算${R} ${D}（采样 ${first} 起，${label}）${R}"
   if [ -n "$quota" ]; then
     printf '  已用 %.1f GB / 套餐 %s GB（%.0f%%）   日均 %.1f GB' \
       "$used" "$quota" "$(awk -v u="$used" -v q="$quota" 'BEGIN{printf "%.0f", u*100/q}')" "$daily"
@@ -1583,6 +1594,7 @@ show_traffic_estimate() {
     printf '  已用 %.1f GB   日均 %.1f GB' "$used" "$daily"
     if [ "$enough" = "1" ]; then printf '，预计月底 %.0f GB\n' "$proj"; else printf '（覆盖 %.1f 小时，暂不推算月底）\n' "$hours"; fi
     dim "  想按套餐提醒：在 /etc/cake-fairshare/config 里设 QUOTA_GB=1024 这类上限"
+    dim "  只按出方向计费的机器（如 Lightsail）再加 QUOTA_MODE=\"egress\""
   fi
   dim "  依据是每分钟采样；若中途重启采样 timer，统计会以已有样本为准"
 }
@@ -2294,7 +2306,7 @@ sync_units() {
   fi
   # 注意 grep 的是 .timer 文件：OnUnitActiveSec / OnCalendar 写在 timer 里，
   # 拿 .service 去 grep 永远查不到，会每次升级都白重写一遍。
-  if [ -f "${LOG_UNIT%.service}.timer" ] && ! grep -qs 'OnUnitActiveSec=60s' "${LOG_UNIT%.service}.timer"; then
+  if [ -f "${LOG_UNIT%.service}.timer" ] && ! grep -qsF 'OnCalendar=*-*-* *:*:00' "${LOG_UNIT%.service}.timer"; then
     if install_log_timer >/dev/null 2>&1; then changed="${changed} 每分钟采样"; fi
   fi
   if [ -f "${REPORT_UNIT%.service}.timer" ] && ! grep -qs '23:00:00' "${REPORT_UNIT%.service}.timer"; then
@@ -2460,9 +2472,10 @@ EOF
 Description=Sample CAKE bandwidth every minute
 
 [Timer]
-OnBootSec=90s
-OnUnitActiveSec=60s
-AccuracySec=5s
+# 按墙钟整分钟触发：OnUnitActiveSec 会累积 service 运行时间与 5s 精度误差，
+# 实测每条约 63 秒，导致按 60 秒积分的流量估算系统性偏低约 5%。
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
 Unit=cake-fairshare-log.service
 
 [Install]
@@ -2470,6 +2483,8 @@ WantedBy=timers.target
 EOF
   systemctl daemon-reload
   systemctl enable --now cake-fairshare-log.timer >/dev/null 2>&1
+  # 已运行的 timer 需要重启才会按新的 OnCalendar 重新排程
+  systemctl try-restart cake-fairshare-log.timer >/dev/null 2>&1
 }
 
 menu_log() {
