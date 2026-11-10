@@ -1,5 +1,17 @@
 # Changelog
 
+## v3.6.15 — 2026-11-10
+
+### 新增 / 修复
+
+- **卸载功能**：`cake-fairshare uninstall [--yes] [--keep-data]`，菜单第 14 项。
+  - 停用并删除 4 组 systemd 单元（主服务、采样、日报、测速）与对应 `.timer`；
+  - 按状态文件恢复启用前的 qdisc，状态丢失时兜底清除残留的 `cake`/`cake_mq` 和本工具创建的 `ifb`；
+  - 删除 `/usr/local/sbin/cake-fairshare`、短命令 `cake`、升级备份、`/etc/cake-fairshare`、`/var/lib/cake-fairshare`；
+  - 默认删除日志、采样、日报与默认测速历史，`--keep-data` 可保留；
+  - 不改动网卡 IP、路由、DNS、BBR/sysctl、防火墙，也不卸载 speedtest 命令；
+  - 卸载后自动核对残留，并提示安装期间停用过的第三方限速服务如何恢复。
+
 ## v3.6.14 — 2026-11-10
 
 ### 新增 / 修复

@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.14"
+VERSION="3.6.15"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -2381,6 +2381,119 @@ sync_units() {
   fi
 }
 
+do_uninstall() {
+  local yes=0 keep=0 a ifc ans sd disabled_prev=""
+  for a in "$@"; do
+    case "$a" in
+      --yes | -y) yes=1 ;;
+      --keep-data) keep=1 ;;
+      *) die "uninstall：未知参数 $a（可用 --yes / --keep-data）" ;;
+    esac
+  done
+  require_root
+  load_conf
+
+  say ""
+  say "${B}卸载 cake-fairshare${R}"
+  hr
+  say "将执行："
+  say "  · 停止整形，恢复启用前的 qdisc，并删除我们创建的 ifb"
+  say "  · 停用并删除 systemd 单元（主服务 / 采样 / 日报 / 测速）"
+  say "  · 删除命令 /usr/local/sbin/cake-fairshare 与短命令 cake（含升级备份）"
+  say "  · 删除配置与状态目录 /etc/cake-fairshare、/var/lib/cake-fairshare"
+  if [ "$keep" = 1 ]; then
+    say "  · 保留日志与测速历史（--keep-data）"
+  else
+    say "  · 删除日志、采样、日报与默认测速历史"
+  fi
+  say ""
+  say "不会改动：网卡 IP、路由、DNS、BBR/sysctl、防火墙、已安装的 speedtest 命令"
+  hr
+
+  if [ "$yes" != 1 ]; then
+    printf '确认卸载？输入 yes 继续：'
+    read -r ans || ans=""
+    [ "$ans" = "yes" ] || { say "已取消"; return 0; }
+  fi
+
+  # 记住曾停用的第三方限速服务，卸载后给出恢复提示
+  [ -r "${CONF_DIR}/disabled-units" ] && disabled_prev=$(sort -u "${CONF_DIR}/disabled-units" | tr '\n' ' ')
+
+  # 1) 先停定时器与服务：停掉主服务会触发 ExecStop，把 qdisc 恢复原样
+  local units="cake-fairshare.service cake-fairshare-log.service cake-fairshare-log.timer \
+cake-fairshare-report.service cake-fairshare-report.timer \
+cake-fairshare-speedtest.service cake-fairshare-speedtest.timer"
+  systemctl stop $units >/dev/null 2>&1
+  systemctl disable $units >/dev/null 2>&1
+  rm -f "$UNIT" "$LOG_UNIT" "${LOG_UNIT%.service}.timer" \
+        "$REPORT_UNIT" "${REPORT_UNIT%.service}.timer" \
+        "$SPEEDTEST_UNIT" "${SPEEDTEST_UNIT%.service}.timer"
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl reset-failed $units >/dev/null 2>&1
+  ok "已停用并移除 systemd 单元"
+
+  # 2) 撤销整形（正常路径）；配置或状态丢失时再按实际队列兜底清理
+  do_stop >/dev/null 2>&1 || true
+  for ifc in ${IFACES:-$(primary_iface)}; do
+    case "$(root_qdisc "$ifc")" in
+      cake | cake_mq)
+        tc qdisc del dev "$ifc" ingress >/dev/null 2>&1
+        tc qdisc del dev "$ifc" root >/dev/null 2>&1
+        ok "已清除 $ifc 上残留的 cake"
+        ;;
+    esac
+  done
+  for ifc in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^ifb[0-9]+$/ {print $2}'); do
+    case "$(root_qdisc "$ifc")" in
+      cake | cake_mq) ip link del "$ifc" >/dev/null 2>&1 && ok "已删除队列设备 $ifc" ;;
+    esac
+  done
+
+  # 3) 删除命令本体（当前进程已读入内存，删文件不影响本次运行）
+  rm -f "$SELF_INSTALL" "$ALIAS_LINK" >/dev/null 2>&1
+  rm -f "${SELF_INSTALL}".bak.* >/dev/null 2>&1
+  ok "已删除命令 $SELF_INSTALL 与短命令 $ALIAS_LINK"
+
+  # 4) 删除配置与状态
+  rm -rf "$CONF_DIR" /var/lib/cake-fairshare
+  ok "已删除配置与状态目录"
+
+  # 5) 数据：默认删除；--keep-data 时保留
+  if [ "$keep" != 1 ]; then
+    rm -f "$LOG_FILE" "$SAMPLE_LOG" "$DAILY_LOG" >/dev/null 2>&1
+    sd="${SPEEDTEST_DIR:-$SPEEDTEST_DIR_DEF}"
+    if [ "$sd" = "$SPEEDTEST_DIR_DEF" ]; then
+      rm -rf "$sd"
+    else
+      dim "  测速历史目录为自定义路径，未删除：$sd"
+    fi
+    ok "已删除日志、采样与测速历史"
+  else
+    dim "  已保留：$LOG_FILE / $SAMPLE_LOG / $DAILY_LOG / ${SPEEDTEST_DIR:-$SPEEDTEST_DIR_DEF}"
+  fi
+
+  # 6) 结果核对
+  hr
+  local left=0
+  [ -e "$SELF_INSTALL" ] && left=1
+  [ -e "$ALIAS_LINK" ] && left=1
+  [ -e "$CONF_DIR" ] && left=1
+  systemctl list-unit-files 'cake-fairshare*' --no-legend 2>/dev/null | grep -q . && left=1
+  for ifc in ${IFACES:-$(primary_iface)}; do
+    case "$(root_qdisc "$ifc")" in cake | cake_mq) left=1 ;; esac
+  done
+  if [ "$left" -eq 0 ]; then
+    ok "卸载完成，未发现残留"
+  else
+    note "仍有残留，请按上面的提示手动检查"
+  fi
+  if [ -n "$disabled_prev" ]; then
+    dim "  安装期间停用过的其它限速服务：$disabled_prev"
+    dim "  需要恢复请执行：systemctl enable --now <服务名>"
+  fi
+  dim "  网卡、路由、DNS、BBR、防火墙均未改动"
+}
+
 do_upgrade() {
   local mode="ask" tmp new bak ans rc f
   case "${1:-}" in
@@ -2947,6 +3060,7 @@ draw_menu() {
   say " 11) 带宽健康报告（是否被限速，可给小白看）"
   say " 12) 立即测速并记录（马上跑，不等空闲）"
   say " 13) 在线升级（检查并升级到 GitHub 最新版）"
+  say " 14) 卸载（停止整形并删除服务与配置）"
   say "  0) 退出"
   hr
   # 主动提示：缺什么就直接说，不用用户自己去逐项翻
@@ -2984,6 +3098,7 @@ main_menu() {
       11) health_report; pause ;;
       12) record_speedtest now; pause ;;
       13) do_upgrade; pause ;;
+      14) do_uninstall; pause; exit 0 ;;
       0|q|Q) say ""; exit 0 ;;
       *) note "无效输入"; sleep 1 ;;
     esac
@@ -3017,6 +3132,8 @@ cake-fairshare v${VERSION} — 按在线人数自动平分带宽
   cake-fairshare preflight      只检查环境，不改任何东西
   cake-fairshare upgrade        检查并升级到最新版（--check 只看不升）
   cake-fairshare sync-units     把 systemd unit 同步到当前版本的模板
+  cake-fairshare uninstall [--yes] [--keep-data]
+                                停止整形并彻底卸载；--keep-data 保留日志与测速历史
   cake-fairshare --help
 
 配置：${CONF}
@@ -3064,6 +3181,11 @@ case "${1:-}" in
     do_upgrade "${1:-}"
     ;;
   sync-units)     require_root; sync_units ;;
+  uninstall|remove)
+    shift
+    require_root
+    do_uninstall "$@"
+    ;;
   preflight)      require_root; preflight ;;
   init)
     shift

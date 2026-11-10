@@ -243,7 +243,18 @@ cake-fairshare init [带宽] [--clean]   # 一键配置 + 启用 + 开机自启
 cake-fairshare health           # 带宽健康报告（限速历史，给小白看的版本）
 cake-fairshare upgrade           # 检查并升级到最新版（--check 只看不升）
 cake-fairshare sync-units        # 把 systemd unit 同步到当前版本的模板
+cake-fairshare uninstall         # 停止整形并彻底卸载（--keep-data 保留日志与测速历史）
 ```
+
+## 卸载
+
+```bash
+sudo cake-fairshare uninstall                    # 交互确认
+sudo cake-fairshare uninstall --yes              # 无交互（批量下线用）
+sudo cake-fairshare uninstall --keep-data        # 保留日志与测速历史
+```
+
+会停服务与 4 个定时器、恢复启用前的 qdisc、删除本工具创建的 `ifb`、命令、配置与状态；默认连日志和测速历史一起删。**不会动**网卡 IP、路由、DNS、BBR/sysctl、防火墙，也不会卸载 `speedtest` 命令。菜单第 14 项是同一功能。
 
 ## 环境预检与自动清理
 
