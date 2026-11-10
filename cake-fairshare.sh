@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.13"
+VERSION="3.6.14"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -36,6 +36,8 @@ DAILY_LOG="/var/log/cake-fairshare-daily.log"
 REPORT_UNIT="/etc/systemd/system/cake-fairshare-report.service"
 SPEEDTEST_UNIT="/etc/systemd/system/cake-fairshare-speedtest.service"
 SPEEDTEST_DIR_DEF="/root/speedtest_history"
+# 直连下载复核用的测试文件：Ookla 多点都低时用它判断「真限速」还是「测速服务异常」
+PROBE_URL_DEF="http://cachefly.cachefly.net/50mb.test"
 
 if [ -t 1 ]; then
   R=$'\033[0m'; B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; RD=$'\033[31m'; C=$'\033[36m'; D=$'\033[2m'
@@ -127,7 +129,7 @@ load_conf() {
   RATE_EGRESS=""; RATE_INGRESS=""
   CAKE_OPTS=""; CAKE_OPTS_INGRESS="$DEF_CAKE_OPTS_INGRESS"
   AUTO_TEST_IDLE_PCT="15"; AUTO_TEST_MAXWAIT="900"; AUTO_TEST_SERVER_ID=""
-  QUOTA_GB=""; QUOTA_MODE="both"
+  QUOTA_GB=""; PROBE_URL=""; QUOTA_MODE="both"
   # shellcheck disable=SC1090
   if [ -r "$CONF" ]; then . "$CONF"; fi
 }
@@ -163,6 +165,8 @@ save_conf() {
     printf 'QUOTA_GB="%s"\n' "${QUOTA_GB:-}"
     printf '# 套餐计费方向：both=出+入都算；egress=只算服务器发出（AWS Lightsail 等）\n'
     printf 'QUOTA_MODE="%s"\n' "${QUOTA_MODE:-both}"
+    printf '# 直连下载复核地址（Ookla 多点都低时用）；留空用内置的 CacheFly 50MB\n'
+    printf 'PROBE_URL="%s"\n' "${PROBE_URL:-}"
   } >"$CONF"
 }
 
@@ -1474,7 +1478,7 @@ diagnose() {
 show_speedtest_history() {
   local dir="${SPEEDTEST_DIR:-/root/speedtest_history}"
   [ -d "$dir" ] || return 0
-  local files f ts dl ul maxdl maxul judge hh tag total tag_peak
+  local files f ts dl ul maxdl maxul judge hh tag total tag_peak probe is_meas
   total=$(ls -1 "$dir"/speedtest_* 2>/dev/null | wc -l | tr -d ' ')
   [ "${total:-0}" -gt 0 ] || return 0
   files=$(ls -1t "$dir"/speedtest_* 2>/dev/null | head -12 | sort)
@@ -1482,7 +1486,7 @@ show_speedtest_history() {
   read -r maxdl maxul <<<"$(speedtest_baseline "$dir")"
   awk -v m="$maxdl" 'BEGIN{exit !(m > 0)}' || return 0
 
-  ST_ALERTS=0; ST_PEAK_LOWS=0; ST_RECORDS=$total
+  ST_ALERTS=0; ST_PEAK_LOWS=0; ST_MEAS=0; ST_RECORDS=$total
   say ""
   say "  ${B}历史测速记录${R} ${D}（$dir   基准：下行 ${maxdl} / 上行 ${maxul} Mbps）${R}"
   for f in $files; do
@@ -1490,10 +1494,15 @@ show_speedtest_history() {
     dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
     ul=$(grep -m1 'Upload:' "$f" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
     [ -n "$dl" ] || continue
-    # 测速记录里带 # judge=（新版才会写）：recovered/mild/low-all
+    # 测速记录里带 # judge=（新版才会写）：
+    #   recovered（换点复核恢复）/ mild（偏低）/ low-all（多点仍低）
+    #   low-ookla（多点低但直连下载正常）/ confirmed-low（直连下载也低）
     judge=$(grep -m1 '^# judge=' "$f" 2>/dev/null | sed 's/^# judge=//; s/ .*//')
-    tag=""
+    probe=$(grep -m1 '^# judge=' "$f" 2>/dev/null | sed -n 's/.*probe=\([0-9][0-9.]*\).*/\1/p')
+    tag=""; is_meas=0
     case "$judge" in
+      low-ookla) tag="测速服务异常（直连实测 ${probe:-?} Mbps）"; is_meas=1 ;;
+      confirmed-low) tag="偏低（直连下载已确认）" ;;
       low-all) tag="偏低（多点复核仍低）" ;;
       mild) tag="偏低" ;;
     esac
@@ -1513,13 +1522,18 @@ show_speedtest_history() {
       *) tag_peak=0 ;;
     esac
     if [ -n "$tag" ]; then
-      if [ "$tag_peak" = "1" ]; then
+      if [ "$is_meas" = "1" ]; then
+        # 测速服务异常不算线路问题，单独计数
+        ST_MEAS=$((ST_MEAS + 1))
+        printf '    %-18s 下行 %7s   上行 %7s Mbps   %b%s%b\n' "$ts" "$dl" "${ul:-?}" "$C" "$tag" "$R"
+      elif [ "$tag_peak" = "1" ]; then
         tag="高峰偏低（常见波动）"
         ST_PEAK_LOWS=$((ST_PEAK_LOWS + 1))
+        printf '    %-18s 下行 %7s   上行 %7s Mbps   %b%s%b\n' "$ts" "$dl" "${ul:-?}" "$Y" "$tag" "$R"
       else
         ST_ALERTS=$((ST_ALERTS + 1))
+        printf '    %-18s 下行 %7s   上行 %7s Mbps   %b%s%b\n' "$ts" "$dl" "${ul:-?}" "$Y" "$tag" "$R"
       fi
-      printf '    %-18s 下行 %7s   上行 %7s Mbps   %b%s%b\n' "$ts" "$dl" "${ul:-?}" "$Y" "$tag" "$R"
     else
       printf '    %-18s 下行 %7s   上行 %7s Mbps\n' "$ts" "$dl" "${ul:-?}"
     fi
@@ -1715,7 +1729,7 @@ health_report() {
   ' "$SAMPLE_LOG"
   hr
 
-  ST_ALERTS=0; ST_PEAK_LOWS=0; ST_RECORDS=0
+  ST_ALERTS=0; ST_PEAK_LOWS=0; ST_MEAS=0; ST_RECORDS=0
   show_speedtest_history
   show_traffic_estimate
 
@@ -1727,13 +1741,17 @@ health_report() {
   elif [ "${ST_ALERTS:-0}" -eq 0 ]; then
     if [ "${ST_PEAK_LOWS:-0}" -gt 0 ]; then
       ok "平峰测速正常；${ST_PEAK_LOWS} 次高峰（19:00~01:00）偏低属常见波动"
+    elif [ "${ST_MEAS:-0}" -gt 0 ]; then
+      ok "测速偏低已复核为测速服务异常（直连下载正常），线路本身没有问题"
     else
       ok "历史测速未发现异常，带宽表现正常"
     fi
+    [ "${ST_MEAS:-0}" -gt 0 ] && dim "其中 ${ST_MEAS} 次经直连下载复核为测速服务异常（蓝色标出），不计入限速判断"
   else
     note "历史测速中有 ${ST_ALERTS} 次明显偏低（已用黄色标出），其余时间正常"
     dim "  短暂一两次通常是上游抖动或当时本机流量占满；频繁出现才需要考虑换线路或找服务商"
     [ "${ST_PEAK_LOWS:-0}" -gt 0 ] && dim "另有 ${ST_PEAK_LOWS} 次落在高峰时段，按常见波动统计，未计入异常"
+    [ "${ST_MEAS:-0}" -gt 0 ] && dim "另有 ${ST_MEAS} 次经直连下载复核为测速服务异常，未计入异常"
   fi
   dim "  说明：采样是「实际用量」，空闲时速度当然是 0，用量低不等于被限速。"
   dim "        采样也看不出上游是否在限速——被云网关丢掉的包，系统里根本看不到。"
@@ -2047,13 +2065,34 @@ speedtest_try() {
   printf '%s %s\n' "$dl" "${ul:-0}"
 }
 
+http_probe_dl() {
+  # 用固定大小的下载文件测真实下行能力（Mbps），作为 Ookla 之外的第三方证据。
+  # 单条 TCP 流受 BDP 限制，跑不满长肥链路，所以开 4 路并发再相加。
+  # 只读下载、写完即删，不落盘、不影响转发。
+  local url="${PROBE_URL:-$PROBE_URL_DEF}" secs="${PROBE_SECS:-12}" i s speed=0 tmp
+  command -v curl >/dev/null 2>&1 || { printf '0\n'; return 1; }
+  tmp="${TMPDIR:-/tmp}/.cfs_probe.$$"
+  for i in 1 2 3 4; do
+    curl -sS -L --max-time "$secs" -o /dev/null -w '%{speed_download}' "$url" \
+      >"${tmp}.${i}" 2>/dev/null &
+  done
+  wait
+  for i in 1 2 3 4; do
+    s=$(cat "${tmp}.${i}" 2>/dev/null)
+    case "$s" in '' | *[!0-9.]*) s=0 ;; esac
+    speed=$(awk -v a="$speed" -v b="$s" 'BEGIN{printf "%.0f", a + b}')
+  done
+  rm -f "${tmp}".1 "${tmp}".2 "${tmp}".3 "${tmp}".4
+  awk -v b="$speed" 'BEGIN{printf "%.1f\n", b * 8 / 1000000}'
+}
+
 record_speedtest() {
   # 跑一次测速并写入历史目录（供「带宽健康报告」读取）。
   # $1 = auto 时先等链路空闲，避免在晚高峰跟用户抢带宽。
   load_conf
   require_root
   local bin mode="${1:-now}" ifc dir ts f out dl ul waited=0 pct maxwait mb_in mb_out cap_e cap_i d
-  local base_dl=0 base_ul=0 judge="" retested=0 tmp_out best_dl best_ul best_out best_score ref_score sid sid_used d u d_score
+  local base_dl=0 base_ul=0 judge="" retested=0 tmp_out best_dl best_ul best_out best_score ref_score sid sid_used d u d_score probe=""
   ensure_speedtest || return 1
   bin=$SPEEDTEST_BIN_PATH
   ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
@@ -2178,9 +2217,24 @@ record_speedtest() {
       judge="mild"
       dl="$best_dl"; ul="$best_ul"; out="$best_out"
     else
-      judge="low-all"
       dl="$best_dl"; ul="$best_ul"; out="$best_out"
       note "复核仍偏低：${retested} 个测速点都不理想（最低 ${best_score} Mbps）"
+      # Ookla 多点同时低，也可能是测速服务自身异常（实测遇到过 3 Mbps 而实际 180 Mbps）。
+      # 用直连下载做第三方验证：能跑到基准的 25% 以上就按「测速服务异常」记，不计入限速告警。
+      say "  改用直连下载再确认一次（约 12 秒）..."
+      probe=$(http_probe_dl 2>/dev/null)
+      case "$probe" in
+        '' | 0 | 0.0) judge="low-all" ;;
+        *)
+          if awk -v p="$probe" -v b="$base_dl" 'BEGIN{exit !(p+0 > 0 && b+0 > 0 && p+0 >= b*0.25)}'; then
+            judge="low-ookla"
+            ok "直连下载实测 ${probe} Mbps（约为基准的 $(awk -v p="$probe" -v b="$base_dl" 'BEGIN{printf "%.0f", p*100/b}')%），判断为测速服务异常，非线路限速"
+          else
+            judge="confirmed-low"
+            note "直连下载只有 ${probe} Mbps，与测速结果一致，按线路偏低记录"
+          fi
+          ;;
+      esac
     fi
   fi
 
@@ -2189,7 +2243,7 @@ record_speedtest() {
   {
     date '+%Y/%m/%d %H:%M'
     printf '%s\n' "$out"
-    [ -n "$judge" ] && printf '# judge=%s retested=%d\n' "$judge" "$retested"
+    [ -n "$judge" ] && printf '# judge=%s retested=%d%s\n' "$judge" "$retested" "${probe:+ probe=$probe}"
   } >"$f"
   # 只留最近 240 条（每 4 小时一条约 40 天）
   ls -1t "$dir"/speedtest_* 2>/dev/null | tail -n +241 | while read -r d; do rm -f "$d"; done
