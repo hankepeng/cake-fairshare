@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.15"
+VERSION="3.6.16"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
 DEF_RATE="190mbit"
@@ -1974,14 +1974,18 @@ set_default_timezone() {
 pick_speedtest_server() {
   # 自动固定测速点：最近 3 个候选各测一次，取双向都稳的那个。
   # 调用时机在整形生效之后，测速流量被 CAKE 限住，不会冲击在线用户。
-  local bin ids id out dl ul sc best_id="" best=0
+  # $1=1 强制重选（原固定点被 Ookla 下架 / 连续偏低时），会跳过旧 id，
+  # 否则旧点仍在候选里，重选可能又选回同一个。
+  local bin ids id out dl ul sc best_id="" best=0 force="${1:-0}" old="${AUTO_TEST_SERVER_ID:-}"
   bin=$(speedtest_bin) || return 1
-  [ -n "${AUTO_TEST_SERVER_ID:-}" ] && return 0
-  ids=$("$bin" -L 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {print $1}' | head -n3)
+  [ -n "$old" ] && [ "$force" != "1" ] && return 0
+  ids=$("$bin" -L 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {print $1}' | head -n 4)
   [ -n "$ids" ] || return 1
   say "  自动挑选测速点（候选：$(printf '%s' "$ids" | tr '\n' ' ')）"
   for id in $ids; do
-    out=$("$bin" -s "$id" --accept-license --accept-gdpr 2>/dev/null)
+    [ "$id" = "$old" ] && continue
+    # 定时器里 HOME 由 unit 提供，这里再兜一层，避免手工/其它调用方式崩溃
+    out=$(HOME="${HOME:-/root}" "$bin" --accept-license --accept-gdpr --server-id="$id" 2>/dev/null)
     dl=$(printf '%s\n' "$out" | grep -m1 'Download:' | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)
     ul=$(printf '%s\n' "$out" | grep -m1 'Upload:' | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)
     [ -n "$dl" ] && [ -n "$ul" ] || continue
@@ -2052,6 +2056,16 @@ speedtest_baseline() {
   printf '%s %s\n' "$maxdl" "$maxul"
 }
 
+speedtest_server_invalid() {
+  # 区分「固定测速点不可用」和「网络抖动/超时」。
+  # 前者换点即可恢复，后者换点没意义，只会把好好的 ID 改掉。
+  case "$1" in
+    *NoServersException* | *"No servers defined"* | *"Invalid server id"* | \
+      *"Server not found"* | *"does not exist"* | *"Unable to connect to server"*) return 0 ;;
+  esac
+  return 1
+}
+
 speedtest_try() {
   # 指定测速点跑一次，完整输出写到 $4，成功时输出 "下行 上行"
   local bin="$1" sid="$2" home_dir="$3" outf="$4" opt dl ul
@@ -2092,7 +2106,7 @@ record_speedtest() {
   load_conf
   require_root
   local bin mode="${1:-now}" ifc dir ts f out dl ul waited=0 pct maxwait mb_in mb_out cap_e cap_i d
-  local base_dl=0 base_ul=0 judge="" retested=0 tmp_out best_dl best_ul best_out best_score ref_score sid sid_used d u d_score probe=""
+  local base_dl=0 base_ul=0 judge="" retested=0 tmp_out best_dl best_ul best_out best_score ref_score sid sid_used d u d_score probe="" alt_id=""
   ensure_speedtest || return 1
   bin=$SPEEDTEST_BIN_PATH
   ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
@@ -2151,13 +2165,38 @@ record_speedtest() {
   fi
 
   say "  正在测速，约 15~30 秒，期间会短暂占用带宽..."
+  local got=0
   # shellcheck disable=SC2086
-  if ! out=$(HOME="$home_dir" "$bin" $st_opt 2>&1); then
+  if out=$(HOME="$home_dir" "$bin" $st_opt 2>&1); then
+    got=1
+  fi
+  # 固定测速点被 Ookla 下架/改号时，所有点都会报 NoServersException。
+  # 以前只能每小时失败到有人发现，现在当场换点、写回配置并重测。
+  if [ "$got" -eq 0 ] && [ "$(basename "$bin")" = "speedtest" ] && [ -n "${AUTO_TEST_SERVER_ID:-}" ] \
+    && speedtest_server_invalid "$out"; then
+    note "固定测速点 $AUTO_TEST_SERVER_ID 已不可用（Ookla 下架或改号），自动重选"
+    logline "SPEEDTEST server-invalid id=$AUTO_TEST_SERVER_ID"
+    if pick_speedtest_server 1; then
+      st_opt="--accept-license --accept-gdpr --server-id=$AUTO_TEST_SERVER_ID"
+      # shellcheck disable=SC2086
+      if out=$(HOME="$home_dir" "$bin" $st_opt 2>&1); then
+        got=1
+        say "  已换到测速点 $AUTO_TEST_SERVER_ID 重测"
+      fi
+    else
+      bad "重选测速点失败（Ookla 服务器列表也拿不到，可能是本机出网异常）"
+    fi
+  fi
+  if [ "$got" -eq 0 ]; then
     note "第一次失败，5 秒后重试一次"
     sleep 5
     # shellcheck disable=SC2086
     if ! out=$(HOME="$home_dir" "$bin" $st_opt 2>&1); then
-      logline "SPEEDTEST fail"
+      if speedtest_server_invalid "$out"; then
+        logline "SPEEDTEST fail err=noservers"
+      else
+        logline "SPEEDTEST fail err=network"
+      fi
       bad "测速失败"
       printf '%s\n' "$out" | head -4 | sed 's/^/    /'
       case "$out" in
@@ -2200,7 +2239,7 @@ record_speedtest() {
         dim "  复核 $sid：下行 $d / 上行 $u Mbps"
         d_score=$(awk -v a="$d" -v b="$u" 'BEGIN{printf "%.2f", (b+0>0 && b<a)?b:a}')
         if awk -v s="$d_score" -v m="$best_score" 'BEGIN{exit !(s > m)}'; then
-          best_dl="$d"; best_ul="$u"; best_score="$d_score"; best_out=$(cat "$tmp_out")
+          best_dl="$d"; best_ul="$u"; best_score="$d_score"; best_out=$(cat "$tmp_out"); alt_id="$sid"
         fi
       fi
     done
@@ -2213,6 +2252,20 @@ record_speedtest() {
       judge="recovered"
       dl="$best_dl"; ul="$best_ul"; out="$best_out"
       ok "复核恢复正常：下行 ${dl} / 上行 ${ul} Mbps（测速点问题，非线路限速）"
+      # 固定点还活着但自己在劣化（实测 OneProvider 49517 后期就是这种状态：
+      # 能连上，但只有换点才达标）。连续 2 次靠复核才达标就把它换掉，
+      # 否则每次测速都要多跑两个点、多耗一倍流量。
+      prev=$(cat "$CONF_DIR/speedtest-badserver" 2>/dev/null)
+      case "$prev" in '' | *[!0-9]*) prev=0 ;; esac
+      prev=$((prev + 1))
+      printf '%s\n' "$prev" >"$CONF_DIR/speedtest-badserver" 2>/dev/null
+      if [ "$prev" -ge 2 ] && [ -n "$alt_id" ] && [ -n "${AUTO_TEST_SERVER_ID:-}" ]; then
+        AUTO_TEST_SERVER_ID="$alt_id"
+        save_conf
+        printf '0\n' >"$CONF_DIR/speedtest-badserver" 2>/dev/null
+        note "固定测速点连续 ${prev} 次偏低，已改用 $alt_id"
+        logline "SPEEDTEST repin id=$alt_id"
+      fi
     elif awk -v s="$best_score" -v r="$ref_score" 'BEGIN{exit !(r>0 && s >= r*0.3)}'; then
       judge="mild"
       dl="$best_dl"; ul="$best_ul"; out="$best_out"
@@ -2236,6 +2289,9 @@ record_speedtest() {
           ;;
       esac
     fi
+  else
+    # 本次完全正常：清掉「固定点劣化」的累计次数
+    printf '0\n' >"$CONF_DIR/speedtest-badserver" 2>/dev/null
   fi
 
   ts=$(date '+%Y%m%d_%H%M%S')
@@ -2245,8 +2301,9 @@ record_speedtest() {
     printf '%s\n' "$out"
     [ -n "$judge" ] && printf '# judge=%s retested=%d%s\n' "$judge" "$retested" "${probe:+ probe=$probe}"
   } >"$f"
-  # 只留最近 240 条（每 4 小时一条约 40 天）
-  ls -1t "$dir"/speedtest_* 2>/dev/null | tail -n +241 | while read -r d; do rm -f "$d"; done
+  # 保留上限 720 条：4 小时一档约 120 天，每小时一档约 30 天。
+  # 原来 240 条在每小时一档下只有 10 天，月度对比会缺数据。
+  ls -1t "$dir"/speedtest_* 2>/dev/null | tail -n +721 | while read -r d; do rm -f "$d"; done
 
   logline "SPEEDTEST ok dl=${dl:-?} ul=${ul:-?} judge=${judge:-ok} retested=$retested file=$f"
   if [ "$judge" = "recovered" ]; then
