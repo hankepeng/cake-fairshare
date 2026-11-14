@@ -37,6 +37,10 @@ DAILY_LOG="/var/log/cake-fairshare-daily.log"
 REPORT_UNIT="/etc/systemd/system/cake-fairshare-report.service"
 SPEEDTEST_UNIT="/etc/systemd/system/cake-fairshare-speedtest.service"
 SPEEDTEST_DIR_DEF="/root/speedtest_history"
+# 采样与测速记录的保留天数：健康报告只统计最近这么多天，超出的物理删除
+DATA_KEEP_DAYS=7
+# 采样被裁短后，本月流量不能再靠日志重算，这里单独累计（月流量计费提醒要用）
+TRAFFIC_STATE="/var/lib/cake-fairshare/traffic"
 # 直连下载复核用的测试文件：Ookla 多点都低时用它判断「真限速」还是「测速服务异常」
 PROBE_URL_DEF="http://cachefly.cachefly.net/50mb.test"
 
@@ -1344,12 +1348,32 @@ qdisc_stat() {
 }
 
 trim_log() {
+  # 采样只保留最近 DATA_KEEP_DAYS 天（含今天）。每分钟 1 条约 1440 行/天，
+  # 阈值放到 7 天略多才开始重写，避免每分钟都搬一遍文件。
   [ -f "$SAMPLE_LOG" ] || return 0
-  local n
+  local n cutoff limit
   n=$(wc -l <"$SAMPLE_LOG" 2>/dev/null || echo 0)
-  if [ "$n" -gt 30000 ]; then
-    tail -n 20000 "$SAMPLE_LOG" >"${SAMPLE_LOG}.tmp" && mv "${SAMPLE_LOG}.tmp" "$SAMPLE_LOG"
-  fi
+  limit=$(( (DATA_KEEP_DAYS + 1) * 1440 ))
+  [ "$n" -gt "$limit" ] || return 0
+  cutoff=$(date -d "-$((DATA_KEEP_DAYS - 1)) days" '+%F' 2>/dev/null) || return 0
+  awk -v c="$cutoff" 'substr($0, 1, 10) >= c' "$SAMPLE_LOG" >"${SAMPLE_LOG}.tmp" \
+    && mv "${SAMPLE_LOG}.tmp" "$SAMPLE_LOG"
+}
+
+traffic_accrue() {
+  # $1=入向 Mbps  $2=出向 Mbps。采样日志会被裁到 7 天，本月用量必须单独累计，
+  # 否则「本月流量」会随着裁剪越算越少，套餐告警就失真了。
+  local f m used used_eg first cur
+  f="$TRAFFIC_STATE"
+  mkdir -p "$(dirname "$f")" 2>/dev/null
+  cur=$(date '+%Y-%m')
+  used=0; used_eg=0; first=""
+  [ -r "$f" ] && read -r m used used_eg first <"$f" 2>/dev/null
+  [ "${m:-}" = "$cur" ] || { used=0; used_eg=0; first=""; }
+  [ -n "${first:-}" ] || first=$(date '+%F %T')
+  awk -v m="$cur" -v u="${used:-0}" -v e="${used_eg:-0}" -v i="${1:-0}" -v o="${2:-0}" -v f="$first" \
+    'BEGIN{printf "%s %.4f %.4f %s\n", m, u + (i + o) * 60 / 8, e + o * 60 / 8, f}' >"${f}.tmp" \
+    && mv "${f}.tmp" "$f" 2>/dev/null
 }
 
 sample_once() {
@@ -1410,6 +1434,7 @@ sample_once() {
     "${eo:-0}" "${ed:-0}" "${io:-0}" "${cn:-0}" \
     "${a1:-}" "${c1:-0}" "${a2:-}" "${c2:-0}" "${a3:-}" "${c3:-0}" \
     "${eb:-0}" "${ib:-0}" >>"$SAMPLE_LOG"
+  traffic_accrue "$rx_m" "$tx_m"
   trim_log
 }
 
