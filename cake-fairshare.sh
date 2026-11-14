@@ -18,10 +18,11 @@
 
 set -uo pipefail
 
-VERSION="3.6.16"
+VERSION="3.6.17"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
-# 190mbit = 腾讯云轻量 200M 峰值套餐的 95%；换成 30M/100M 套餐时改成 28mbit/95mbit
-DEF_RATE="190mbit"
+# 180mbit = 腾讯云轻量 200M 峰值套餐的 90%，留出余量避免长期贴顶被限速；
+# 换成 30M/100M 套餐时改成 27mbit/90mbit
+DEF_RATE="180mbit"
 DEF_CAKE_OPTS_INGRESS="ack-filter"
 CONF_DIR="/etc/cake-fairshare"
 CONF="${CONF_DIR}/config"
@@ -913,7 +914,7 @@ menu_custom() {
   fi
   chosen=$(printf '%s' "$chosen" | tr -s ' ' | sed 's/^ //; s/ $//')
 
-  read -rp "总带宽（95/100M/1gbit，按套餐峰值打 95%）[默认 ${cur:-$DEF_RATE}]: " rate
+  read -rp "总带宽（95/100M/1gbit，按套餐峰值打 90% 左右）[默认 ${cur:-$DEF_RATE}]: " rate
   rate=$(normalize_rate "${rate:-${cur:-$DEF_RATE}}") || { bad "带宽格式无法识别"; pause; return 1; }
 
   if [ -n "${RATE_EGRESS:-}" ] || [ -n "${RATE_INGRESS:-}" ]; then ovr=1; fi
@@ -1167,7 +1168,7 @@ do_init() {
       RATE_INGRESS=$(normalize_rate "$d_in" 2>/dev/null) || RATE_INGRESS=""
     fi
     ok "沿用机器上现有的整形速率：出口 ${RATE_EGRESS:-$RATE} / 入口 ${RATE_INGRESS:-$RATE}"
-    dim "  想改就显式指定：cake-fairshare init 190mbit（或菜单第 7 / 9 项）"
+    dim "  想改就显式指定：cake-fairshare init 180mbit（或菜单第 7 / 9 项）"
   fi
   save_conf
   ok "配置：网卡 $IFACES  带宽 $RATE  方向 both  入口参数 ${CAKE_OPTS_INGRESS:-无}"
@@ -2001,15 +2002,14 @@ pick_speedtest_server() {
 }
 
 bootstrap_extras() {
-  # 首次安装收尾：时区、测速工具与固定测速点、采样与日报一次配好。
-  # 自动测速默认**不开**：一次测速要跑几百 MB（900M 机器约 800MB），
-  # 常驻每小时跑会持续吃掉套餐流量，交给用户按需在菜单里开。
+  # 首次安装收尾：时区、测速工具、采样与日报。
+  # 安装阶段**不跑任何测速**（包括固定测速点）：测速是真实流量，
+  # 用户没要求就不该在装脚本时产生。等用户在菜单里开启自动测速时再固定测速点。
   set_default_timezone || true
   if ensure_speedtest; then
-    pick_speedtest_server || note "测速点自动固定失败，可稍后编辑 $CONF 指定 AUTO_TEST_SERVER_ID"
     install_log_timer >/dev/null 2>&1 && ok "已开启每分钟采样"
     install_daily_timer >/dev/null 2>&1 && ok "已开启每日 23:00 日报"
-    note "自动测速默认关闭（每次约几十到几百 MB，避免长期占用套餐流量）"
+    note "自动测速默认关闭，安装阶段也不会跑测速（每次约几十到几百 MB）"
     dim "  需要时： cake → 10) 采样日志与现场诊断 → 9) 开启自动测速"
   else
     note "测速工具安装失败；采样与日报不受影响"
@@ -2773,6 +2773,10 @@ menu_log() {
       show_daily
       ;;
     9)
+      if [ -z "${AUTO_TEST_SERVER_ID:-}" ]; then
+        note "首次开启：先跑 3 次测速固定测速点（约几十到几百 MB），之后数据才可比"
+        pick_speedtest_server || note "测速点自动固定失败，可稍后编辑 $CONF 指定 AUTO_TEST_SERVER_ID"
+      fi
       if install_speedtest_timer; then
         ok "已开启：每 4 小时检查一次（00/04/08/12/16/20 点），链路空闲才测速"
         dim "  查看： systemctl list-timers cake-fairshare-speedtest.timer"
