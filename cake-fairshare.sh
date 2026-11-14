@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.17"
+VERSION="3.6.18"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 180mbit = 腾讯云轻量 200M 峰值套餐的 90%，留出余量避免长期贴顶被限速；
 # 换成 30M/100M 套餐时改成 27mbit/90mbit
@@ -1372,7 +1372,7 @@ traffic_accrue() {
   [ "${m:-}" = "$cur" ] || { used=0; used_eg=0; first=""; }
   [ -n "${first:-}" ] || first=$(date '+%F %T')
   awk -v m="$cur" -v u="${used:-0}" -v e="${used_eg:-0}" -v i="${1:-0}" -v o="${2:-0}" -v f="$first" \
-    'BEGIN{printf "%s %.4f %.4f %s\n", m, u + (i + o) * 60 / 8, e + o * 60 / 8, f}' >"${f}.tmp" \
+    'BEGIN{printf "%s %.6f %.6f %s\n", m, u + (i + o) * 60 / 8 / 1024, e + o * 60 / 8 / 1024, f}' >"${f}.tmp" \
     && mv "${f}.tmp" "$f" 2>/dev/null
 }
 
@@ -1567,21 +1567,31 @@ show_speedtest_history() {
 }
 
 show_traffic_estimate() {
-  # 按采样日志估算本月流量：样本里是 Mbps，timer 按分钟对齐，间隔即 60 秒
+  # 本月用量：采样日志只留 7 天，所以读数来自 traffic_accrue 的累计状态；
+  # 刚升级还没有状态时，回退到按日志重算一次并落盘。
   load_conf
   [ -r "$SAMPLE_LOG" ] || return 0
-  local month first last used used_eg
+  local month first used used_eg m
   month=$(date '+%Y-%m')
-  first=""; last=""; used=0; used_eg=0
-  IFS='|' read -r first last used used_eg <<<"$(awk -F, -v m="$month" '
-    index($1, m) == 1 {
-      used    += ($2 + $3) * 60 / 8 / 1024
-      used_eg += $3 * 60 / 8 / 1024
-      if (first == "") first = $1
-      last = $1
-    }
-    END { if (used > 0.05) printf "%s|%s|%.2f|%.2f\n", first, last, used, used_eg }' "$SAMPLE_LOG")"
-  [ -n "${used:-}" ] && awk -v u="$used" 'BEGIN{exit !(u > 0.05)}' || return 0
+  first=""; used=0; used_eg=0
+  if [ -r "$TRAFFIC_STATE" ]; then
+    read -r m used used_eg first <"$TRAFFIC_STATE" 2>/dev/null
+    [ "${m:-}" = "$month" ] || { used=0; used_eg=0; first=""; }
+  fi
+  if ! awk -v u="${used:-0}" 'BEGIN{exit !(u > 0.05)}'; then
+    IFS='|' read -r first _ used used_eg <<<"$(awk -F, -v m="$month" '
+      index($1, m) == 1 {
+        used    += ($2 + $3) * 60 / 8 / 1024
+        used_eg += $3 * 60 / 8 / 1024
+        if (first == "") first = $1
+        last = $1
+      }
+      END { if (used > 0.05) printf "%s|%s|%.2f|%.2f\n", first, last, used, used_eg }' "$SAMPLE_LOG")"
+    [ -n "${used:-}" ] && awk -v u="$used" 'BEGIN{exit !(u > 0.05)}' || return 0
+    mkdir -p "$(dirname "$TRAFFIC_STATE")" 2>/dev/null
+    printf '%s %.4f %.4f %s\n' "$month" "$used" "$used_eg" "${first:-$(date '+%F %T')}" \
+      >"${TRAFFIC_STATE}.tmp" 2>/dev/null && mv "${TRAFFIC_STATE}.tmp" "$TRAFFIC_STATE"
+  fi
 
   # 计费方向：Lightsail 这类只算服务器发出（$3 tx），按双向算会高估近一倍
   local qmode label
@@ -1592,8 +1602,9 @@ show_traffic_estimate() {
   [ "$qmode" = "egress" ] && used="${used_eg:-0}"
 
   local t0 t1 hours days total_days today remain daily proj quota
-  t0=$(date -d "$first" +%s 2>/dev/null) || return 0
-  t1=$(date -d "$last" +%s 2>/dev/null) || return 0
+  t0=$(date -d "${first:-now}" +%s 2>/dev/null) || return 0
+  # 用当前时间而不是日志里的最后一条：日志被裁到 7 天后，last 不再是「现在」
+  t1=$(date +%s)
   hours=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", (b-a)/3600}')
   # 样本覆盖不到 3 小时就外推"日均/月底"会离谱（1 小时 × 24 倍），只报已用
   if awk -v h="$hours" 'BEGIN{exit !(h < 3)}'; then
@@ -1647,14 +1658,24 @@ health_report() {
     return 1
   fi
 
-  local cap_e cap_i n
+  local cap_e cap_i n sf cutoff
   cap_e=$(unit_num "${RATE_EGRESS:-$RATE}")
   cap_i=$(unit_num "${RATE_INGRESS:-$RATE}")
-  n=$(wc -l <"$SAMPLE_LOG")
+  # 只统计最近 DATA_KEEP_DAYS 天（含今天）。日志本身也按这个窗口裁剪，
+  # 这里再筛一次，保证刚裁剪前后、以及手工导入的旧数据不会混进报告。
+  cutoff=$(date -d "-$((DATA_KEEP_DAYS - 1)) days" '+%F' 2>/dev/null)
+  sf="${TMPDIR:-/tmp}/.cfs_sample.$$"
+  if [ -n "$cutoff" ] && awk -v c="$cutoff" 'substr($0, 1, 10) >= c' "$SAMPLE_LOG" >"$sf" 2>/dev/null; then
+    :
+  else
+    cp "$SAMPLE_LOG" "$sf"
+  fi
+  n=$(wc -l <"$sf")
 
   if [ "$n" -lt 2 ]; then
     note "采样数据只有 ${n} 条，还不够生成报告"
     dim "  采样每分钟 1 条，跑十几分钟后再看就有内容了"
+    rm -f "$sf"
     return 1
   fi
 
@@ -1666,7 +1687,7 @@ health_report() {
   fi
   hr
   printf '  整形上限：下行 %s Mbps / 上行 %s Mbps\n' "$cap_e" "$cap_i"
-  printf '  采样样本：%s 条（每分钟 1 条，约 %s 分钟）\n' "$n" "$n"
+  printf '  采样样本：%s 条（近 %s 天，每分钟 1 条）\n' "$n" "$DATA_KEEP_DAYS"
   hr
 
   awk -F, -v ce="$cap_e" -v ci="$cap_i" '
@@ -1752,12 +1773,13 @@ health_report() {
         if (shown == 0) printf "    （没有单个 IP 超过 5 条连接）\n"
       }
     }
-  ' "$SAMPLE_LOG"
+  ' "$sf"
   hr
 
   ST_ALERTS=0; ST_PEAK_LOWS=0; ST_MEAS=0; ST_RECORDS=0
   show_speedtest_history
   show_traffic_estimate
+  rm -f "$sf"
 
   say ""
   hr
@@ -2326,9 +2348,12 @@ record_speedtest() {
     printf '%s\n' "$out"
     [ -n "$judge" ] && printf '# judge=%s retested=%d%s\n' "$judge" "$retested" "${probe:+ probe=$probe}"
   } >"$f"
-  # 保留上限 720 条：4 小时一档约 120 天，每小时一档约 30 天。
-  # 原来 240 条在每小时一档下只有 10 天，月度对比会缺数据。
-  ls -1t "$dir"/speedtest_* 2>/dev/null | tail -n +721 | while read -r d; do rm -f "$d"; done
+  # 历史测速只保留最近 DATA_KEEP_DAYS 天，同时兜一层条数上限
+  # （每小时一档 7 天约 168 条，用不着 720 条那种老上限）。
+  find "$dir" -maxdepth 1 -name 'speedtest_*' -type f -mtime +$((DATA_KEEP_DAYS - 1)) \
+    -delete 2>/dev/null
+  ls -1t "$dir"/speedtest_* 2>/dev/null | tail -n +$((DATA_KEEP_DAYS * 24 + 1)) \
+    | while read -r d; do rm -f "$d"; done
 
   logline "SPEEDTEST ok dl=${dl:-?} ul=${ul:-?} judge=${judge:-ok} retested=$retested file=$f"
   if [ "$judge" = "recovered" ]; then
