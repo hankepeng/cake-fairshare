@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.20"
+VERSION="3.6.21"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 180mbit = 腾讯云轻量 200M 峰值套餐的 90%，留出余量避免长期贴顶被限速；
 # 换成 30M/100M 套餐时改成 27mbit/90mbit
@@ -1656,6 +1656,46 @@ show_traffic_estimate() {
   dim "  依据是每分钟采样；若中途重启采样 timer，统计会以已有样本为准"
 }
 
+# 入口方向的丢包不能直接看 tc 的 dropped：其中绝大多数是 ack-filter 主动丢的
+# 重复 ACK（纯 ACK 不承载数据，丢掉只会让对端少发 ACK，用户无感）。
+# 真正影响体验的是「数据包」被丢，这里把两者拆开，只按数据包算比例。
+report_ingress_drops() {
+  local ifc ifb all pkt drp ack data ratio verdict
+  ifc=$(printf '%s' "${IFACES:-}" | awk '{print $1}')
+  [ -n "$ifc" ] || ifc=$(primary_iface)
+  [ -n "$ifc" ] || return 0
+  ifb=$(get_state "$ifc" IFB)
+  [ -n "$ifb" ] || ifb="ifb0"
+  all=$(tc -s qdisc show dev "$ifb" 2>/dev/null)
+  [ -n "$all" ] || return 0
+  read -r pkt drp <<<"$(printf '%s\n' "$all" \
+    | sed -n 's/.* bytes \([0-9]*\) pkt (dropped \([0-9]*\),.*/\1 \2/p' | head -n1)"
+  [ -n "${pkt:-}" ] || return 0
+  ack=$(printf '%s\n' "$all" | awk '/ack_drop/ {for (i = 2; i <= 4; i++) s += $i} END {print s + 0}')
+  data=$((drp - ack)); [ "$data" -lt 0 ] && data=0
+  ratio=$(awk -v d="$data" -v p="$pkt" -v t="$drp" \
+    'BEGIN { n = p + t; printf "%.3f", (n > 0 ? d * 100 / n : 0) }')
+  verdict=$(awk -v r="$ratio" 'BEGIN{
+    if (r < 0.1) print "正常"
+    else if (r < 0.5) print "轻微"
+    else print "异常" }')
+  cnt_fmt() {
+    if [ "$1" -ge 10000 ]; then awk -v n="$1" 'BEGIN{printf "%.0f 万", n/10000}'; else printf '%s' "$1"; fi
+  }
+  if [ "$drp" -eq 0 ]; then
+    printf '  入口丢弃：0 包 → %s（上游没有丢包）\n' "$verdict"
+    return 0
+  fi
+  printf '  入口丢弃：%s包 → %s（ACK 过滤 %s，真实数据 %s，占 %s%%）\n' \
+    "$(cnt_fmt "$drp")" "$verdict" "$(cnt_fmt "$ack")" "$(cnt_fmt "$data")" "$ratio"
+  if [ "$verdict" = "正常" ]; then
+    dim "  ACK 过滤是入口整形的正常手段；数据丢弃 <0.1% 时 TCP 会自动重传，用户只会看到速度贴顶"
+  else
+    dim "  数据丢弃偏高会影响用户上传（UDP 类业务直接丢），建议提高整形上限或分流"
+  fi
+  return 0
+}
+
 health_report() {
   load_conf
   if [ ! -r "$SAMPLE_LOG" ]; then
@@ -1780,6 +1820,7 @@ health_report() {
       }
     }
   ' "$sf"
+  report_ingress_drops
   hr
 
   ST_ALERTS=0; ST_PEAK_LOWS=0; ST_MEAS=0; ST_RECORDS=0
