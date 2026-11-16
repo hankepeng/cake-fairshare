@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.18"
+VERSION="3.6.20"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 180mbit = 腾讯云轻量 200M 峰值套餐的 90%，留出余量避免长期贴顶被限速；
 # 换成 30M/100M 套餐时改成 27mbit/90mbit
@@ -1512,7 +1512,7 @@ show_speedtest_history() {
   read -r maxdl maxul <<<"$(speedtest_baseline "$dir")"
   awk -v m="$maxdl" 'BEGIN{exit !(m > 0)}' || return 0
 
-  ST_ALERTS=0; ST_PEAK_LOWS=0; ST_MEAS=0; ST_RECORDS=$total
+  ST_ALERTS=0; ST_PEAK_LOWS=0; ST_MEAS=0; ST_UNVER=0; ST_RECORDS=$total
   say ""
   say "  ${B}历史测速记录${R} ${D}（$dir   基准：下行 ${maxdl} / 上行 ${maxul} Mbps）${R}"
   for f in $files; do
@@ -1523,12 +1523,14 @@ show_speedtest_history() {
     # 测速记录里带 # judge=（新版才会写）：
     #   recovered（换点复核恢复）/ mild（偏低）/ low-all（多点仍低）
     #   low-ookla（多点低但直连下载正常）/ confirmed-low（直连下载也低）
+    #   low-unverified（探针不可达，没法复核，不计入告警）
     judge=$(grep -m1 '^# judge=' "$f" 2>/dev/null | sed 's/^# judge=//; s/ .*//')
     probe=$(grep -m1 '^# judge=' "$f" 2>/dev/null | sed -n 's/.*probe=\([0-9][0-9.]*\).*/\1/p')
-    tag=""; is_meas=0
+    tag=""; is_meas=0; is_unver=0
     case "$judge" in
       low-ookla) tag="测速服务异常（直连实测 ${probe:-?} Mbps）"; is_meas=1 ;;
       confirmed-low) tag="偏低（直连下载已确认）" ;;
+      low-unverified) tag="无法复核（探针不可达）"; is_unver=1 ;;
       low-all) tag="偏低（多点复核仍低）" ;;
       mild) tag="偏低" ;;
     esac
@@ -1552,6 +1554,10 @@ show_speedtest_history() {
         # 测速服务异常不算线路问题，单独计数
         ST_MEAS=$((ST_MEAS + 1))
         printf '    %-18s 下行 %7s   上行 %7s Mbps   %b%s%b\n' "$ts" "$dl" "${ul:-?}" "$C" "$tag" "$R"
+      elif [ "$is_unver" = "1" ]; then
+        # 探针不可达：既不能证明异常，也不能证明正常，单独计数且不计入告警
+        ST_UNVER=$((ST_UNVER + 1))
+        printf '    %-18s 下行 %7s   上行 %7s Mbps   %b%s%b\n' "$ts" "$dl" "${ul:-?}" "$D" "$tag" "$R"
       elif [ "$tag_peak" = "1" ]; then
         tag="高峰偏低（常见波动）"
         ST_PEAK_LOWS=$((ST_PEAK_LOWS + 1))
@@ -1795,11 +1801,13 @@ health_report() {
       ok "历史测速未发现异常，带宽表现正常"
     fi
     [ "${ST_MEAS:-0}" -gt 0 ] && dim "其中 ${ST_MEAS} 次经直连下载复核为测速服务异常（蓝色标出），不计入限速判断"
+    [ "${ST_UNVER:-0}" -gt 0 ] && dim "另有 ${ST_UNVER} 次因探针不可达无法复核（灰色标出），未计入判断"
   else
     note "历史测速中有 ${ST_ALERTS} 次明显偏低（已用黄色标出），其余时间正常"
     dim "  短暂一两次通常是上游抖动或当时本机流量占满；频繁出现才需要考虑换线路或找服务商"
     [ "${ST_PEAK_LOWS:-0}" -gt 0 ] && dim "另有 ${ST_PEAK_LOWS} 次落在高峰时段，按常见波动统计，未计入异常"
     [ "${ST_MEAS:-0}" -gt 0 ] && dim "另有 ${ST_MEAS} 次经直连下载复核为测速服务异常，未计入异常"
+    [ "${ST_UNVER:-0}" -gt 0 ] && dim "另有 ${ST_UNVER} 次因探针不可达无法复核，未计入异常"
   fi
   dim "  说明：采样是「实际用量」，空闲时速度当然是 0，用量低不等于被限速。"
   dim "        采样也看不出上游是否在限速——被云网关丢掉的包，系统里根本看不到。"
@@ -2130,7 +2138,7 @@ http_probe_dl() {
   # 用固定大小的下载文件测真实下行能力（Mbps），作为 Ookla 之外的第三方证据。
   # 单条 TCP 流受 BDP 限制，跑不满长肥链路，所以开 4 路并发再相加。
   # 只读下载、写完即删，不落盘、不影响转发。
-  local url="${PROBE_URL:-$PROBE_URL_DEF}" secs="${PROBE_SECS:-12}" i s speed=0 tmp
+  local url="${PROBE_URL:-$PROBE_URL_DEF}" secs="${PROBE_SECS:-8}" i s speed=0 tmp got=0
   command -v curl >/dev/null 2>&1 || { printf '0\n'; return 1; }
   tmp="${TMPDIR:-/tmp}/.cfs_probe.$$"
   for i in 1 2 3 4; do
@@ -2141,10 +2149,14 @@ http_probe_dl() {
   for i in 1 2 3 4; do
     s=$(cat "${tmp}.${i}" 2>/dev/null)
     case "$s" in '' | *[!0-9.]*) s=0 ;; esac
+    awk -v v="$s" 'BEGIN{exit !(v > 0)}' && got=1
     speed=$(awk -v a="$speed" -v b="$s" 'BEGIN{printf "%.0f", a + b}')
   done
   rm -f "${tmp}".1 "${tmp}".2 "${tmp}".3 "${tmp}".4
   awk -v b="$speed" 'BEGIN{printf "%.1f\n", b * 8 / 1000000}'
+  # 四路全部没拿到字节（地址被墙、超时、curl 不可用）时返回 1：
+  # 这表示「没法复核」，不是「实测为 0」，调用方不应据此判定线路偏低。
+  [ "$got" = "1" ]
 }
 
 record_speedtest() {
@@ -2153,7 +2165,7 @@ record_speedtest() {
   load_conf
   require_root
   local bin mode="${1:-now}" ifc dir ts f out dl ul waited=0 pct maxwait mb_in mb_out cap_e cap_i d
-  local base_dl=0 base_ul=0 judge="" retested=0 tmp_out best_dl best_ul best_out best_score ref_score sid sid_used d u d_score probe="" alt_id=""
+  local base_dl=0 base_ul=0 judge="" retested=0 tmp_out best_dl best_ul best_out best_score ref_score sid sid_used d u d_score probe="" alt_id="" prc=0 res=""
   ensure_speedtest || return 1
   bin=$SPEEDTEST_BIN_PATH
   ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
@@ -2281,13 +2293,17 @@ record_speedtest() {
     for sid in $sid; do
       [ "$sid" = "$sid_used" ] && continue
       [ "$retested" -ge 2 ] && break
+      # 别用 read 直接判成功：here-string 永远带换行，命令没输出时 read 也返回 0，
+      # 会打印出「复核 xxx：下行  / 上行  Mbps」这种空值，还白占一次复核名额。
+      res=$(speedtest_try "$bin" "$sid" "$home_dir" "$tmp_out")
+      [ -n "$res" ] || continue
+      read -r d u <<<"$res"
+      [ -n "$d" ] || continue
       retested=$((retested + 1))
-      if read -r d u <<<"$(speedtest_try "$bin" "$sid" "$home_dir" "$tmp_out")"; then
-        dim "  复核 $sid：下行 $d / 上行 $u Mbps"
-        d_score=$(awk -v a="$d" -v b="$u" 'BEGIN{printf "%.2f", (b+0>0 && b<a)?b:a}')
-        if awk -v s="$d_score" -v m="$best_score" 'BEGIN{exit !(s > m)}'; then
-          best_dl="$d"; best_ul="$u"; best_score="$d_score"; best_out=$(cat "$tmp_out"); alt_id="$sid"
-        fi
+      dim "  复核 $sid：下行 $d / 上行 $u Mbps"
+      d_score=$(awk -v a="$d" -v b="$u" 'BEGIN{printf "%.2f", (b+0>0 && b<a)?b:a}')
+      if awk -v s="$d_score" -v m="$best_score" 'BEGIN{exit !(s > m)}'; then
+        best_dl="$d"; best_ul="$u"; best_score="$d_score"; best_out=$(cat "$tmp_out"); alt_id="$sid"
       fi
     done
     rm -f "$tmp_out"
@@ -2321,20 +2337,31 @@ record_speedtest() {
       note "复核仍偏低：${retested} 个测速点都不理想（最低 ${best_score} Mbps）"
       # Ookla 多点同时低，也可能是测速服务自身异常（实测遇到过 3 Mbps 而实际 180 Mbps）。
       # 用直连下载做第三方验证：能跑到基准的 25% 以上就按「测速服务异常」记，不计入限速告警。
-      say "  改用直连下载再确认一次（约 12 秒）..."
-      probe=$(http_probe_dl 2>/dev/null)
-      case "$probe" in
-        '' | 0 | 0.0) judge="low-all" ;;
-        *)
-          if awk -v p="$probe" -v b="$base_dl" 'BEGIN{exit !(p+0 > 0 && b+0 > 0 && p+0 >= b*0.25)}'; then
-            judge="low-ookla"
-            ok "直连下载实测 ${probe} Mbps（约为基准的 $(awk -v p="$probe" -v b="$base_dl" 'BEGIN{printf "%.0f", p*100/b}')%），判断为测速服务异常，非线路限速"
-          else
-            judge="confirmed-low"
-            note "直连下载只有 ${probe} Mbps，与测速结果一致，按线路偏低记录"
-          fi
-          ;;
-      esac
+      say "  改用直连下载再确认一次（约 8 秒）..."
+      probe=$(http_probe_dl 2>/dev/null); prc=$?
+      if [ "$prc" -ne 0 ]; then
+        # 探针拉不到字节（国内机器访问境外测试文件常被墙）——这是「没法复核」，
+        # 不能当成「直连也低」，否则健康报告天天误报。
+        judge="low-unverified"
+        note "直连复核探针不可达，本次只记「未复核」，不计入限速判断"
+        dim "  可在配置里把 PROBE_URL 指向本地/国内可达的大文件"
+      else
+        case "$probe" in
+          '' | 0 | 0.0)
+            judge="low-unverified"
+            note "直连复核没有测到有效速度，本次记为「未复核」，不计入限速判断"
+            ;;
+          *)
+            if awk -v p="$probe" -v b="$base_dl" 'BEGIN{exit !(p+0 > 0 && b+0 > 0 && p+0 >= b*0.25)}'; then
+              judge="low-ookla"
+              ok "直连下载实测 ${probe} Mbps（约为基准的 $(awk -v p="$probe" -v b="$base_dl" 'BEGIN{printf "%.0f", p*100/b}')%），判断为测速服务异常，非线路限速"
+            else
+              judge="confirmed-low"
+              note "直连下载只有 ${probe} Mbps，与测速结果一致，按线路偏低记录"
+            fi
+            ;;
+        esac
+      fi
     fi
   else
     # 本次完全正常：清掉「固定点劣化」的累计次数
