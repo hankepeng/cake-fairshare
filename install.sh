@@ -3,10 +3,11 @@
 # cake-fairshare 安装脚本
 #
 #   bash install.sh                 安装 + 自动配置启用
-#                                   （节点名=主机名、北京时间、自动装 speedtest
-#                                    并固定测速点、开启采样/日报两个定时器；
+#                                   （节点名=主机名、北京时间、自动装 speedtest；
+#                                    不跑任何测速、不挑选测速点；
+#                                    开启采样/日报两个定时器；
 #                                    自动测速默认关闭，装完可在菜单里自行开启；
-#                                    已有整形就沿用其速率，没有则用默认 190mbit）
+#                                    已有整形就沿用其速率，没有则用默认 180mbit）
 #   bash install.sh 95mbit          安装 + 指定带宽
 #   bash install.sh --clean         安装 + 自动停用冲突的限速服务
 #   bash install.sh 95mbit --clean  两者组合
