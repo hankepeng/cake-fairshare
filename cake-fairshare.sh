@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.22"
+VERSION="3.6.23"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 180mbit = 腾讯云轻量 200M 峰值套餐的 90%，留出余量避免长期贴顶被限速；
 # 换成 30M/100M 套餐时改成 27mbit/90mbit
@@ -43,6 +43,8 @@ DATA_KEEP_DAYS=7
 TRAFFIC_STATE="/var/lib/cake-fairshare/traffic"
 # 直连下载复核用的测试文件：Ookla 多点都低时用它判断「真限速」还是「测速服务异常」
 PROBE_URL_DEF="http://cachefly.cachefly.net/50mb.test"
+# 国内机器改用直连探针：不走 Ookla，直接对国内镜像做 4 路并发下载/上传
+PROBE_URLS_DEF="https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.3-live-server-amd64.iso https://mirror.sjtu.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.3-live-server-amd64.iso"
 
 if [ -t 1 ]; then
   R=$'\033[0m'; B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; RD=$'\033[31m'; C=$'\033[36m'; D=$'\033[2m'
@@ -135,6 +137,7 @@ load_conf() {
   CAKE_OPTS=""; CAKE_OPTS_INGRESS="$DEF_CAKE_OPTS_INGRESS"
   AUTO_TEST_IDLE_PCT="15"; AUTO_TEST_MAXWAIT="900"; AUTO_TEST_SERVER_ID=""
   QUOTA_GB=""; PROBE_URL=""; QUOTA_MODE="both"
+  SPEEDTEST_ENGINE=""; PROBE_URLS=""; PROBE_UP_URL=""
   # shellcheck disable=SC1090
   if [ -r "$CONF" ]; then . "$CONF"; fi
 }
@@ -172,6 +175,12 @@ save_conf() {
     printf 'QUOTA_MODE="%s"\n' "${QUOTA_MODE:-both}"
     printf '# 直连下载复核地址（Ookla 多点都低时用）；留空用内置的 CacheFly 50MB\n'
     printf 'PROBE_URL="%s"\n' "${PROBE_URL:-}"
+    printf '# 测速引擎：ookla=Speedtest CLI（境外机器）；probe=国内直连探针，不跑 Ookla\n'
+    printf 'SPEEDTEST_ENGINE="%s"\n' "${SPEEDTEST_ENGINE:-ookla}"
+    printf '# 国内探针的下载地址，空格分隔，多个取最好的一次\n'
+    printf 'PROBE_URLS="%s"\n' "${PROBE_URLS:-}"
+    printf '# 国内探针的上传地址（可留空；需要能接收 POST 的国内端点）\n'
+    printf 'PROBE_UP_URL="%s"\n' "${PROBE_UP_URL:-}"
   } >"$CONF"
 }
 
@@ -1994,6 +2003,8 @@ ensure_speedtest() {
   # 缺失时自动安装测速 CLI，结果放进 SPEEDTEST_BIN_PATH。
   # 交互、定时器（无 tty）都走这里，不让用户自己去装。
   # 路线：发行版仓库 → 官方静态二进制兜底。
+  # 国内机器用直连探针，不需要也没有 Ookla 参与
+  if [ "${SPEEDTEST_ENGINE:-ookla}" = "probe" ]; then return 0; fi
   local url="" pm="" installed=0 tmp=""
   SPEEDTEST_BIN_PATH=$(speedtest_bin)
   [ -n "$SPEEDTEST_BIN_PATH" ] && return 0
@@ -2152,6 +2163,21 @@ speedtest_baseline() {
   printf '%s %s\n' "$maxdl" "$maxul"
 }
 
+probe_baseline() {
+  # 国内探针专用基准：只统计探针记录，避免切换引擎时拿 Ookla 的 133M 当基准，
+  # 把正常测到的 90~100M 误判成偏低。样本不足 3 条时不判定。
+  local dir="$1" f dl max=0 n=0
+  for f in $(ls -1t "$dir"/speedtest_* 2>/dev/null | head -60); do
+    grep -q '国内直连探针' "$f" 2>/dev/null || continue
+    dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+    [ -n "$dl" ] || continue
+    n=$((n + 1))
+    max=$(awk -v a="$max" -v b="$dl" 'BEGIN{print (b>a)?b:a}')
+  done
+  [ "$n" -ge 3 ] || max=0
+  printf '%s %s\n' "$max" "$n"
+}
+
 speedtest_server_invalid() {
   # 区分「固定测速点不可用」和「网络抖动/超时」。
   # 前者换点即可恢复，后者换点没意义，只会把好好的 ID 改掉。
@@ -2179,7 +2205,7 @@ http_probe_dl() {
   # 用固定大小的下载文件测真实下行能力（Mbps），作为 Ookla 之外的第三方证据。
   # 单条 TCP 流受 BDP 限制，跑不满长肥链路，所以开 4 路并发再相加。
   # 只读下载、写完即删，不落盘、不影响转发。
-  local url="${PROBE_URL:-$PROBE_URL_DEF}" secs="${PROBE_SECS:-8}" i s speed=0 tmp got=0
+  local url="${1:-${PROBE_URL:-$PROBE_URL_DEF}}" secs="${PROBE_SECS:-8}" i s speed=0 tmp got=0
   command -v curl >/dev/null 2>&1 || { printf '0\n'; return 1; }
   tmp="${TMPDIR:-/tmp}/.cfs_probe.$$"
   for i in 1 2 3 4; do
@@ -2200,6 +2226,89 @@ http_probe_dl() {
   [ "$got" = "1" ]
 }
 
+probe_engine_dl() {
+  # 国内探针：按 PROBE_URLS 逐个跑 4 路并发下载，取最好的一次。
+  # 输出 "Mbps 命中的地址"；全部拉不到字节时返回 1（表示无法测量，不是 0）。
+  local urls="${PROBE_URLS:-$PROBE_URLS_DEF}" u best=0 best_url="" got=0 v
+  for u in $urls; do
+    v=$(http_probe_dl "$u" 2>/dev/null)
+    case "$v" in '' | *[!0-9.]*) v=0 ;; esac
+    awk -v a="$v" 'BEGIN{exit !(a > 0)}' && got=1
+    if awk -v a="$v" -v b="$best" 'BEGIN{exit !(a > b)}'; then
+      best="$v"; best_url="$u"
+    fi
+  done
+  printf '%s %s\n' "$best" "$best_url"
+  [ "$got" = "1" ]
+}
+
+http_probe_ul() {
+  # 4 路并发 POST 到国内端点，测真实上行（Mbps）。$1=地址，$2=每路大小(MB)
+  local url="$1" mb="${2:-10}" secs="${PROBE_SECS:-8}" i s speed=0 tmp got=0
+  [ -n "$url" ] || { printf '0\n'; return 1; }
+  command -v curl >/dev/null 2>&1 || { printf '0\n'; return 1; }
+  tmp="${TMPDIR:-/tmp}/.cfs_up.$$"
+  head -c $((mb * 1024 * 1024)) /dev/zero >"${tmp}.bin" 2>/dev/null
+  for i in 1 2 3 4; do
+    curl -sS -o /dev/null --max-time "$secs" -X POST --data-binary @"${tmp}.bin" \
+      -w '%{speed_upload}' "$url" >"${tmp}.${i}" 2>/dev/null &
+  done
+  wait
+  for i in 1 2 3 4; do
+    s=$(cat "${tmp}.${i}" 2>/dev/null)
+    case "$s" in '' | *[!0-9.]*) s=0 ;; esac
+    awk -v v="$s" 'BEGIN{exit !(v > 0)}' && got=1
+    speed=$(awk -v a="$speed" -v b="$s" 'BEGIN{printf "%.0f", a + b}')
+  done
+  rm -f "${tmp}".1 "${tmp}".2 "${tmp}".3 "${tmp}".4 "${tmp}.bin"
+  awk -v b="$speed" 'BEGIN{printf "%.1f\n", b * 8 / 1000000}'
+  [ "$got" = "1" ]
+}
+
+probe_speedtest_record() {
+  # 国内机器专用：不经过 Ookla，只用国内镜像直连测速并写历史记录。
+  local dir="$1" ts f url="" dl="" ul="" judge="" base_dl=0 base_ul=0 res=""
+  say "  国内直连探针测速（不跑 Ookla，约 ${PROBE_SECS:-8} 秒）..."
+  res=$(probe_engine_dl 2>/dev/null)
+  read -r dl url <<<"$res"
+  case "$dl" in '' | *[!0-9.]*) dl=0 ;; esac
+  if awk -v a="$dl" 'BEGIN{exit !(a <= 0)}'; then
+    logline "SPEEDTEST fail engine=probe err=nodata"
+    bad "国内探针全部拉不到数据（检查 PROBE_URLS 或出网）"
+    return 1
+  fi
+  if [ -n "${PROBE_UP_URL:-}" ]; then
+    ul=$(http_probe_ul "$PROBE_UP_URL" 2>/dev/null)
+    case "$ul" in '' | *[!0-9.]* | 0) ul="" ;; esac
+  fi
+
+  read -r base_dl _ <<<"$(probe_baseline "$dir")"
+  if awk -v d="$dl" -v b="$base_dl" 'BEGIN{exit !(b > 0 && d < b * 0.3)}'; then
+    judge="confirmed-low"
+    note "探针实测 ${dl} Mbps，低于历史基准 ${base_dl} 的 30%，按线路偏低记录"
+  elif awk -v d="$dl" -v b="$base_dl" 'BEGIN{exit !(b > 0 && d < b * 0.7)}'; then
+    judge="mild"
+  fi
+
+  ts=$(date '+%Y%m%d_%H%M%S')
+  f="$dir/speedtest_${ts}.txt"
+  {
+    date '+%Y/%m/%d %H:%M'
+    printf '  国内直连探针（4 路并发，%s 秒，Ookla 已关闭）\n' "${PROBE_SECS:-8}"
+    [ -n "$url" ] && printf '     Server: %s\n' "$url"
+    printf '   Download:   %s Mbps\n' "$dl"
+    [ -n "$ul" ] && printf '     Upload:   %s Mbps\n' "$ul"
+    [ -n "$judge" ] && printf '# judge=%s retested=0 probe=%s\n' "$judge" "$dl"
+  } >"$f"
+  find "$dir" -maxdepth 1 -name 'speedtest_*' -type f -mtime +$((DATA_KEEP_DAYS - 1)) \
+    -delete 2>/dev/null
+  ls -1t "$dir"/speedtest_* 2>/dev/null | tail -n +$((DATA_KEEP_DAYS * 24 + 1)) \
+    | while read -r d; do rm -f "$d"; done
+  logline "SPEEDTEST ok engine=probe dl=$dl ul=${ul:-na} judge=${judge:-ok} file=$f"
+  ok "已记录：下行 ${dl} Mbps${ul:+ / 上行 ${ul} Mbps}（国内探针）"
+  return 0
+}
+
 record_speedtest() {
   # 跑一次测速并写入历史目录（供「带宽健康报告」读取）。
   # $1 = auto 时先等链路空闲，避免在晚高峰跟用户抢带宽。
@@ -2207,8 +2316,6 @@ record_speedtest() {
   require_root
   local bin mode="${1:-now}" ifc dir ts f out dl ul waited=0 pct maxwait mb_in mb_out cap_e cap_i d
   local base_dl=0 base_ul=0 judge="" retested=0 tmp_out best_dl best_ul best_out best_score ref_score sid sid_used d u d_score probe="" alt_id="" prc=0 res=""
-  ensure_speedtest || return 1
-  bin=$SPEEDTEST_BIN_PATH
   ifc=$(printf '%s' "$IFACES" | awk '{print $1}')
   [ -n "$ifc" ] || ifc=$(primary_iface)
   dir="${SPEEDTEST_DIR:-$SPEEDTEST_DIR_DEF}"
@@ -2254,6 +2361,14 @@ record_speedtest() {
     logline "SPEEDTEST idle out=${mb_out}M in=${mb_in}M"
     say "  链路空闲（出 ${mb_out} / 入 ${mb_in} Mbps），开始测速"
   fi
+
+  if [ "${SPEEDTEST_ENGINE:-ookla}" = "probe" ]; then
+    probe_speedtest_record "$dir"
+    return $?
+  fi
+
+  ensure_speedtest || return 1
+  bin=$SPEEDTEST_BIN_PATH
 
   # Ookla CLI 需要 HOME 才能读到 ~/.config/ookla 里的 license，
   # systemd 服务默认不设 HOME，会直接抛 basic_string::_M_construct 崩溃。
@@ -2847,6 +2962,7 @@ menu_log() {
   say "  9) 开启自动测速（每 4 小时空闲时跑，忙则跳过）"
   say " 10) 关闭自动测速"
   say " 11) 立即测速一次（马上跑，不等空闲）"
+  say " 12) 切换测速引擎（当前：${SPEEDTEST_ENGINE:-ookla}）"
   read -rp "选择 [默认 1]: " act
   case "${act:-1}" in
     1)
@@ -2891,7 +3007,9 @@ menu_log() {
       show_daily
       ;;
     9)
-      if [ -z "${AUTO_TEST_SERVER_ID:-}" ]; then
+      if [ "${SPEEDTEST_ENGINE:-ookla}" = "probe" ]; then
+        note "当前是国内直连探针模式，不需要固定 Ookla 测速点"
+      elif [ -z "${AUTO_TEST_SERVER_ID:-}" ]; then
         note "首次开启：先跑 3 次测速固定测速点（约几十到几百 MB），之后数据才可比"
         pick_speedtest_server || note "测速点自动固定失败，可稍后编辑 $CONF 指定 AUTO_TEST_SERVER_ID"
       fi
@@ -2911,6 +3029,27 @@ menu_log() {
       ;;
     11)
       record_speedtest now
+      ;;
+    12)
+      say "  1) ookla：Speedtest CLI，境外机器用（固定测速点，数据可比）"
+      say "  2) probe：国内直连探针，不跑 Ookla，用国内镜像 4 路并发下载"
+      read -rp "选择 [在当前 ${SPEEDTEST_ENGINE:-ookla} 上切换]: " eng
+      case "${eng:-}" in
+        1)
+          SPEEDTEST_ENGINE="ookla"
+          save_conf
+          ok "已切到 Ookla（首次测速会自动安装 speedtest CLI）"
+          ;;
+        2)
+          SPEEDTEST_ENGINE="probe"
+          [ -n "${PROBE_URLS:-}" ] || PROBE_URLS="$PROBE_URLS_DEF"
+          save_conf
+          ok "已切到国内直连探针，测速地址："
+          for u in ${PROBE_URLS:-$PROBE_URLS_DEF}; do dim "  $u"; done
+          dim "  上行默认不测；需要的话在 $CONF 里填 PROBE_UP_URL（能接收 POST 的国内端点）"
+          ;;
+        *) note "未改动" ;;
+      esac
       ;;
   esac
   pause
