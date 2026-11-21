@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.23"
+VERSION="3.6.24"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 180mbit = 腾讯云轻量 200M 峰值套餐的 90%，留出余量避免长期贴顶被限速；
 # 换成 30M/100M 套餐时改成 27mbit/90mbit
@@ -611,13 +611,57 @@ menu_monitor() {
   say ""
   say "${B}实时监控${R}"
   hr
-  say "  1) 总体：整机上下行速率 + 队列计数"
-  say "  2) 按客户端：每个 IP 的实时上下行、连接数、估算份额    ← 新"
-  read -rp "选择 [默认 2]: " act
-  case "${act:-2}" in
-    1) monitor ;;
+  say "  1) 按客户端：每个 IP 的实时上下行、连接数、估算份额"
+  say "  2) 总体：整机上下行速率 + 队列计数"
+  read -rp "选择 [默认 1]: " act
+  case "${act:-1}" in
+    2) monitor ;;
     *) monitor_clients ;;
   esac
+}
+
+# 本机正在监听的端口（逗号包裹），供按客户端统计使用。
+# 不按固定列号取值：不同 iproute2 版本在 -H 下是否保留 State 列并不一致，
+# 只认「地址:端口」这种形态，取每行的第一个。
+ADDR_RE='^(\*|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|\[[0-9a-fA-F:.]+\]|[0-9a-fA-F:]+):([0-9]+|\*)$'
+
+listen_ports() {
+  ss -Hltn 2>/dev/null | ADDR_RE="$ADDR_RE" awk '
+    BEGIN { re = ENVIRON["ADDR_RE"] }
+    {
+      for (i = 1; i <= NF; i++)
+        if ($i ~ re) {
+          p = $i
+          sub(/.*:/, "", p)
+          if (p != "22" && p != "*") printf "%s,", p
+          break
+        }
+    }'
+}
+
+client_conn_ips() {
+  # 输出每条「本地端口属于监听端口」的已建立连接的对端 IP（每行一个）
+  local lports="${1:-}"
+  [ -n "$lports" ] || lports=$(listen_ports)
+  [ -n "$lports" ] || return 0
+  ss -Htn state established 2>/dev/null | ADDR_RE="$ADDR_RE" awk -v lp=",$lports" '
+    BEGIN { re = ENVIRON["ADDR_RE"] }
+    {
+      l = ""; p = ""
+      for (i = 1; i <= NF; i++)
+        if ($i ~ re) {
+          if (l == "") l = $i
+          else { p = $i; break }
+        }
+      if (l == "" || p == "") next
+      port = l
+      sub(/.*:/, "", port)
+      if (index(lp, "," port ",") == 0) next
+      ip = p
+      sub(/:[0-9]+$/, "", ip)
+      gsub(/^\[/, "", ip); gsub(/\]$/, "", ip); sub(/^::ffff:/, "", ip)
+      print ip
+    }'
 }
 
 client_snapshot() {
@@ -627,29 +671,39 @@ client_snapshot() {
   # 否则会把 XrayR 出站到目标站的连接也算进来。
   # 监听端口集合由调用方传入（一次采集里不会变），省掉每帧一次 ss 调用。
   local lports="${1:-}"
-  [ -n "$lports" ] || lports=$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed -E 's/.*://' | grep -vx '22' | sort -u | tr '\n' ',')
+  [ -n "$lports" ] || lports=$(listen_ports)
   [ -n "$lports" ] || return 0
-  ss -Htni state established 2>/dev/null | awk -v lp=",$lports" '
-    NF >= 4 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /:[0-9]+$/ && $4 ~ /:[0-9]+$/ {
-      n = split($3, a, ":")
-      if (index(lp, "," a[n] ",") > 0) {
-        ip = $4
-        sub(/:[0-9]+$/, "", ip)
-        gsub(/^\[/, "", ip); gsub(/\]$/, "", ip); sub(/^::ffff:/, "", ip)
-        cur = ip
-        C[ip]++
-      } else {
+  ss -Htni state established 2>/dev/null | ADDR_RE="$ADDR_RE" awk -v lp=",$lports" '
+    BEGIN { re = ENVIRON["ADDR_RE"] }
+    {
+      # 先找本行里的「本端 / 客户端」两个地址。状态列可有可无，
+      # 所以不按列号取，只看字段形态。
+      l = ""; p = ""
+      for (i = 1; i <= NF; i++)
+        if ($i ~ re) {
+          if (l == "") l = $i
+          else { p = $i; break }
+        }
+      if (l != "" && p != "") {
         cur = ""
+        port = l
+        sub(/.*:/, "", port)
+        if (index(lp, "," port ",") > 0) {
+          ip = p
+          sub(/:[0-9]+$/, "", ip)
+          gsub(/^\[/, "", ip); gsub(/\]$/, "", ip); sub(/^::ffff:/, "", ip)
+          cur = ip
+          C[ip]++
+        }
       }
-      next
+      # 字节计数可能和地址同行，也可能在下一行的缩进详情里，两种都取
+      if (cur != "")
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^bytes_sent:/) { v = $i; sub(/^bytes_sent:/, "", v); S[cur] += v + 0 }
+          else if ($i ~ /^bytes_received:/) { v = $i; sub(/^bytes_received:/, "", v); R[cur] += v + 0 }
+        }
     }
-    cur != "" && /bytes_sent:|bytes_received:/ {
-      for (i = 1; i <= NF; i++) {
-        if ($i ~ /^bytes_sent:/) { v = $i; sub(/^bytes_sent:/, "", v); S[cur] += v + 0 }
-        else if ($i ~ /^bytes_received:/) { v = $i; sub(/^bytes_received:/, "", v); R[cur] += v + 0 }
-      }
-    }
-    END { for (k in C) printf "%s %d %d %d\n", k, S[k], R[k], C[k] }
+    END { for (k in C) printf "%s %d %d %d\n", k, S[k] + 0, R[k] + 0, C[k] }
   '
 }
 
@@ -689,7 +743,7 @@ monitor_clients() {
   f3=$(mktemp) || { rm -f "$f1" "$f2"; return 1; }
   # 监听端口在一次观察期间不会变，算一次就够
   local lports
-  lports=$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed -E 's/.*://' | grep -vx '22' | sort -u | tr '\n' ',')
+  lports=$(listen_ports)
   [ -n "$lports" ] || { note "没找到正在监听的代理端口（XrayR 没跑？）"; rm -f "$f1" "$f2" "$f3"; return 1; }
   ifb=$(get_state "$ifc" IFB)
   trap 'stop=1' INT
@@ -1425,15 +1479,9 @@ sample_once() {
   # 不过滤会把 CDN/苹果这类目标的 IP 当成客户端（实测某节点首位是苹果的 17.253.x.x）。
   local a1="" c1="" a2="" c2="" a3="" c3="" lports=""
   if [ "${cn:-0}" -gt 0 ]; then
-    lports=$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed -E 's/.*://' \
-      | grep -vx '22' | sort -u | tr '\n' ',')
+    lports=$(listen_ports)
     if [ -n "$lports" ]; then
-      read -r c1 a1 c2 a2 c3 a3 <<<"$(ss -Htn state established 2>/dev/null \
-        | awk -v lp=",$lports" '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
-            n = split($3, a, ":")
-            if (index(lp, "," a[n] ",") > 0) print $4
-          }' \
-        | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff://' \
+      read -r c1 a1 c2 a2 c3 a3 <<<"$(client_conn_ips "$lports" \
         | sort | uniq -c | sort -rn | head -3 \
         | awk '{printf "%s %s ", $1, $2}')"
     fi
@@ -3059,15 +3107,7 @@ menu_log() {
 # ---------------------------------------------------------- 智能分析与优化 ----
 
 client_ip_count() {
-  local lports
-  lports=$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed -E 's/.*://' | grep -vx '22' | sort -u | tr '\n' ',')
-  if [ -z "$lports" ]; then printf '0\n'; return 0; fi
-  ss -Htn state established 2>/dev/null \
-    | awk -v lp=",$lports" '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
-        n = split($3, a, ":")
-        if (index(lp, "," a[n] ",") > 0) print $4
-      }' \
-    | sed -E 's/:[0-9]+$//' | sort -u | wc -l | tr -d ' '
+  client_conn_ips | sort -u | wc -l | tr -d ' '
 }
 
 speedtest_peaks() {
@@ -3368,7 +3408,7 @@ draw_menu() {
   say "  1) 环境自检（系统 / 内核 / 网卡 / qdisc / BBR / cake 支持）"
   say "  2) 一键优化 / 自定义配置（先分析再套用推荐值）"
   say "  3) 查看当前状态快照"
-  say "  4) 实时监控（总体 / 按客户端看每个 IP 的带宽）"
+  say "  4) 实时监控（按客户端 / 总体看带宽）"
   say "  5) 停止整形并恢复原始 qdisc"
   say "  6) 开机自启（安装 / 移除 / 查看）"
   say "  7) 只改带宽（不动网卡与方向）"
