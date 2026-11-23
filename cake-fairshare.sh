@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.24"
+VERSION="3.6.25"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 180mbit = 腾讯云轻量 200M 峰值套餐的 90%，留出余量避免长期贴顶被限速；
 # 换成 30M/100M 套餐时改成 27mbit/90mbit
@@ -744,7 +744,21 @@ monitor_clients() {
   # 监听端口在一次观察期间不会变，算一次就够
   local lports
   lports=$(listen_ports)
-  [ -n "$lports" ] || { note "没找到正在监听的代理端口（XrayR 没跑？）"; rm -f "$f1" "$f2" "$f3"; return 1; }
+  if [ -z "$lports" ]; then
+    say ""
+    if command -v iptables >/dev/null 2>&1 && iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- '-j DNAT'; then
+      note "本机是 iptables 中转模式（DNAT 到节点），终端用户的连接在内核转发、没有本地 socket"
+      dim  "    所以 ss 看不到用户 IP，这里没有可显示的客户端。cake 仍会按用户 IP 公平分配，"
+      dim  "    只是明细要在后面的节点服务器上看（或在节点上运行本菜单）。"
+      dim  "    本机可看：2) 总体。"
+    else
+      note "没找到正在监听的代理端口（XrayR 没跑？）"
+    fi
+    say ""
+    rm -f "$f1" "$f2" "$f3"
+    pause
+    return 1
+  fi
   ifb=$(get_state "$ifc" IFB)
   trap 'stop=1' INT
   # 只在一开始清一次屏。之后每帧把光标移回左上角就地覆盖，
