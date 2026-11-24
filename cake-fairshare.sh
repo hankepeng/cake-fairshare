@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.25"
+VERSION="3.6.26"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 180mbit = 腾讯云轻量 200M 峰值套餐的 90%，留出余量避免长期贴顶被限速；
 # 换成 30M/100M 套餐时改成 27mbit/90mbit
@@ -1575,17 +1575,21 @@ diagnose() {
 show_speedtest_history() {
   local dir="${SPEEDTEST_DIR:-/root/speedtest_history}"
   [ -d "$dir" ] || return 0
-  local files f ts dl ul maxdl maxul judge hh tag total tag_peak probe is_meas
-  total=$(ls -1 "$dir"/speedtest_* 2>/dev/null | wc -l | tr -d ' ')
-  [ "${total:-0}" -gt 0 ] || return 0
-  files=$(ls -1t "$dir"/speedtest_* 2>/dev/null | head -12 | sort)
+  local files f ts dl ul maxdl maxul judge hh tag total tag_peak probe is_meas cutoff
+  # 只展示最近 3 天（含今天）的记录；文件仍保留 DATA_KEEP_DAYS 天供基准统计
+  cutoff=$(date -d '-2 days' '+%Y%m%d' 2>/dev/null) || cutoff=""
+  files=$(ls -1 "$dir"/speedtest_* 2>/dev/null | awk -F/ -v c="$cutoff" '{
+    n = $NF; sub(/^speedtest_/, "", n)
+    if (c == "" || substr(n, 1, 8) >= c) print
+  }' | sort)
   [ -n "$files" ] || return 0
+  total=$(printf '%s\n' "$files" | grep -c .)
   read -r maxdl maxul <<<"$(speedtest_baseline "$dir")"
   awk -v m="$maxdl" 'BEGIN{exit !(m > 0)}' || return 0
 
   ST_ALERTS=0; ST_PEAK_LOWS=0; ST_MEAS=0; ST_UNVER=0; ST_RECORDS=$total
   say ""
-  say "  ${B}历史测速记录${R} ${D}（$dir   基准：下行 ${maxdl} / 上行 ${maxul} Mbps）${R}"
+  say "  ${B}历史测速记录${R} ${D}（近 3 天；$dir   基准：下行 ${maxdl} / 上行 ${maxul} Mbps）${R}"
   for f in $files; do
     ts=$(head -1 "$f" 2>/dev/null)
     dl=$(grep -m1 'Download:' "$f" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
