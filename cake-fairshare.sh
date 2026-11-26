@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="3.6.26"
+VERSION="3.6.27"
 # ---- 默认参数（新节点一键部署时的取值，按需修改这两行即可）----
 # 180mbit = 腾讯云轻量 200M 峰值套餐的 90%，留出余量避免长期贴顶被限速；
 # 换成 30M/100M 套餐时改成 27mbit/90mbit
@@ -135,7 +135,7 @@ load_conf() {
   IFACES=""; RATE="$DEF_RATE"; MODE="both"
   RATE_EGRESS=""; RATE_INGRESS=""
   CAKE_OPTS=""; CAKE_OPTS_INGRESS="$DEF_CAKE_OPTS_INGRESS"
-  AUTO_TEST_IDLE_PCT="15"; AUTO_TEST_MAXWAIT="900"; AUTO_TEST_SERVER_ID=""
+  AUTO_TEST_IDLE_PCT="5"; AUTO_TEST_MAXWAIT="900"; AUTO_TEST_SERVER_ID=""
   QUOTA_GB=""; PROBE_URL=""; QUOTA_MODE="both"
   SPEEDTEST_ENGINE=""; PROBE_URLS=""; PROBE_UP_URL=""
   # shellcheck disable=SC1090
@@ -164,7 +164,7 @@ save_conf() {
     printf 'CAKE_OPTS="%s"\n' "${CAKE_OPTS:-}"
     printf 'CAKE_OPTS_INGRESS="%s"\n' "${CAKE_OPTS_INGRESS:-}"
     printf '# 自动测速：空闲阈值（占上限百分比）与最长等待秒数\n'
-    printf 'AUTO_TEST_IDLE_PCT="%s"\n' "${AUTO_TEST_IDLE_PCT:-15}"
+    printf 'AUTO_TEST_IDLE_PCT="%s"\n' "${AUTO_TEST_IDLE_PCT:-5}"
     printf 'AUTO_TEST_MAXWAIT="%s"\n' "${AUTO_TEST_MAXWAIT:-900}"
     printf '# 固定测速服务器 id（speedtest -L 查看）；留空则每次自动选最近的，\n'
     printf '# 填了才能让每次数据可比（自动选会换服务器，速度差异很大）\n'
@@ -2390,12 +2390,12 @@ record_speedtest() {
   mkdir -p "$dir" 2>/dev/null
 
   if [ "$mode" = "auto" ]; then
-    pct="${AUTO_TEST_IDLE_PCT:-15}"
+    pct="${AUTO_TEST_IDLE_PCT:-5}"
     maxwait="${AUTO_TEST_MAXWAIT:-900}"
     case "$maxwait" in '' | *[!0-9]*) maxwait=900 ;; esac
     # 上限 25 分钟：每 4 小时才触发一次，但别让等待无限拉长占住定时器
     [ "$maxwait" -le 1500 ] 2>/dev/null || maxwait=1500
-    case "$pct" in '' | *[!0-9]*) pct=15 ;; esac
+    case "$pct" in '' | *[!0-9]*) pct=5 ;; esac
     [ "$pct" -le 100 ] 2>/dev/null || pct=100
 
     # 本小时已经测过就不再测（防同一小时内重复写记录）
@@ -2418,7 +2418,7 @@ record_speedtest() {
       if [ $((SECONDS - waited)) -ge "$maxwait" ]; then
         logline "SPEEDTEST skip busy out=${mb_out}M in=${mb_in}M waited=$((SECONDS - waited))s"
         note "等了 $((maxwait / 60)) 分钟链路一直不空闲（最近一次 出 ${mb_out} / 入 ${mb_in} Mbps），本次跳过，不跟用户抢带宽"
-        dim "  半小时后会自动再检查一次"
+        dim "  本次跳过，下个整点再试"
         return 0
       fi
       # 等待过程要看得见，否则 journal 里只有一行开头，不知道卡在哪
